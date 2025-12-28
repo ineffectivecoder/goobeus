@@ -1,0 +1,8 @@
+github.com/Azure/go-ntlmssp v0.1.0 h1:DjFo6YtWzNqNvQdrwEyr/e4nhU3vRiwenz5QX7sFz+A=
+github.com/Azure/go-ntlmssp v0.1.0/go.mod h1:NYqdhxd/8aAct/s4qSYZEerdPuH1liG2/X9DiVTbhpk=
+github.com/mjwhitta/cli v1.14.0 h1:GmlHEcUaq+ikPe7F75wOc+nJsLWCmLvqaAtXI4Xob0I=
+github.com/mjwhitta/cli v1.14.0/go.mod h1:FExUKKbrIOLNM8cKN1XO1CLYlILSiu/Ae1M9t4gStzw=
+github.com/mjwhitta/errors v1.0.7 h1:gj4MNIc/DiZMZ7B0+Tz/0ExhpwurzOmuO3THTJZGkHw=
+github.com/mjwhitta/errors v1.0.7/go.mod h1:NoDi7MJLuXJuf69DeHiQMveI72TcKJdEAGVb2JJOVOs=
+golang.org/x/crypto v0.17.0 h1:r8bRNjWL3GshPW3gkd+RpvzWrZAwPS49OmTGZ/uhM4k=
+golang.org/x/crypto v0.17.0/go.mod h1:gCAAfMLgwOJRpTjQ2zCCt2OcSfYMTeZVSRtQlPC7Nq4=

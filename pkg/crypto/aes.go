@@ -73,9 +73,10 @@ func EncryptAES(key, plaintext []byte, usage int, etype int) ([]byte, error) {
 		return nil, err
 	}
 
-	// Compute HMAC-SHA1-96 checksum
+	// Compute HMAC-SHA1-96 checksum on PLAINTEXT (per RFC 3962)
+	// IMPORTANT: Kerberos HMAC is computed on confounder || plaintext, NOT on ciphertext!
 	h := hmac.New(sha1.New, ki)
-	h.Write(ciphertext)
+	h.Write(dataToEncrypt)      // NOT ciphertext!
 	checksum := h.Sum(nil)[:12] // Truncate to 96 bits
 
 	// Return ciphertext || checksum
@@ -89,8 +90,8 @@ func EncryptAES(key, plaintext []byte, usage int, etype int) ([]byte, error) {
 // Reverses the encryption:
 //  1. Split input into ciphertext and checksum (last 12 bytes)
 //  2. Derive Ke and Ki from base key
-//  3. Verify HMAC-SHA1-96 checksum
-//  4. Decrypt with AES-CBC-CTS
+//  3. Decrypt with AES-CBC-CTS
+//  4. Verify HMAC-SHA1-96 checksum on DECRYPTED plaintext (per RFC 3962)
 //  5. Strip 16-byte confounder
 func DecryptAES(key, ciphertext []byte, usage int, etype int) ([]byte, error) {
 	keySize := AES128KeySize
@@ -113,15 +114,50 @@ func DecryptAES(key, ciphertext []byte, usage int, etype int) ([]byte, error) {
 	ke := deriveAESKey(key, usage, "enc", keySize)
 	ki := deriveAESKey(key, usage, "int", keySize)
 
-	// Verify checksum
+	// Decrypt FIRST (must decrypt before verifying HMAC per RFC 3962)
+	decrypted, err := aesCBCCTSDecrypt(ke, encData)
+	if err != nil {
+		return nil, err
+	}
+
+	// Verify HMAC on DECRYPTED plaintext (confounder + data), NOT ciphertext
+	// RFC 3962: HMAC is computed on plaintext before encryption
 	h := hmac.New(sha1.New, ki)
-	h.Write(encData)
+	h.Write(decrypted) // IMPORTANT: HMAC on decrypted data!
 	expectedChecksum := h.Sum(nil)[:12]
 	if !hmac.Equal(checksum, expectedChecksum) {
 		return nil, errors.New("checksum verification failed")
 	}
 
-	// Decrypt
+	// Strip 16-byte confounder
+	if len(decrypted) < 16 {
+		return nil, errors.New("decrypted data too short")
+	}
+	return decrypted[16:], nil
+}
+
+// DecryptAESNoChecksum decrypts data encrypted with AES-CTS-HMAC-SHA1, skipping checksum verification.
+// ONLY USE FOR DEBUGGING - this bypasses integrity verification!
+func DecryptAESNoChecksum(key, ciphertext []byte, usage int, etype int) ([]byte, error) {
+	keySize := AES128KeySize
+	if etype == EtypeAES256 {
+		keySize = AES256KeySize
+	}
+	if len(key) != keySize {
+		return nil, errors.New("invalid key size for AES etype")
+	}
+	if len(ciphertext) < 28 {
+		return nil, errors.New("ciphertext too short")
+	}
+
+	// Split into encrypted data and checksum
+	checksumOffset := len(ciphertext) - 12
+	encData := ciphertext[:checksumOffset]
+
+	// Derive encryption key only
+	ke := deriveAESKey(key, usage, "enc", keySize)
+
+	// Decrypt without checksum verification
 	decrypted, err := aesCBCCTSDecrypt(ke, encData)
 	if err != nil {
 		return nil, err
@@ -186,20 +222,37 @@ func dk(key, constant []byte, keySize int) []byte {
 
 // nfold performs the n-fold operation from RFC 3961.
 // This spreads the entropy of the input across the output length.
+// Implementation based on RFC 3961 and verified against gokrb5.
 func nfold(input []byte, outLen int) []byte {
-	inBits := len(input) * 8
-	outBits := outLen * 8
+	k := len(input) * 8 // input length in bits
+	n := outLen * 8     // output length in bits
 
-	// Find LCM of input and output lengths
-	lcm := (inBits * outBits) / gcd(inBits, outBits)
+	// Get the lowest common multiple of the two bit sizes
+	lcmVal := lcm(n, k)
+	replicate := lcmVal / k
 
-	result := make([]byte, outLen)
-	for i := lcm/outBits - 1; i >= 0; i-- {
-		// Rotate and add
-		tmp := rotateRight(input, i*inBits%outBits)
-		result = addBytes(result, tmp)
+	// Build the rotated and concatenated bytes
+	var sumBytes []byte
+	for i := 0; i < replicate; i++ {
+		rotation := 13 * i // RFC 3961 specifies 13-bit rotation
+		sumBytes = append(sumBytes, rotateRightBits(input, rotation)...)
+	}
+
+	// Now fold by adding n-bit chunks with ones-complement addition
+	result := make([]byte, n/8)
+	chunk := make([]byte, n/8)
+	for i := 0; i < lcmVal/n; i++ {
+		for j := 0; j < n/8; j++ {
+			chunk[j] = sumBytes[j+(i*len(chunk))]
+		}
+		result = onesComplementAdd(result, chunk)
 	}
 	return result
+}
+
+// lcm returns least common multiple of x and y
+func lcm(x, y int) int {
+	return (x * y) / gcd(x, y)
 }
 
 func gcd(a, b int) int {
@@ -209,36 +262,63 @@ func gcd(a, b int) int {
 	return a
 }
 
-func rotateRight(data []byte, bits int) []byte {
-	result := make([]byte, len(data))
-	bytes := bits / 8
-	bitOffset := bits % 8
-
-	for i := 0; i < len(data); i++ {
-		srcIdx := (i + bytes) % len(data)
-		nextIdx := (srcIdx + 1) % len(data)
-		result[i] = (data[srcIdx] >> bitOffset) | (data[nextIdx] << (8 - bitOffset))
+// rotateRightBits rotates byte slice right by step bits
+func rotateRightBits(b []byte, step int) []byte {
+	out := make([]byte, len(b))
+	bitLen := len(b) * 8
+	for i := 0; i < bitLen; i++ {
+		v := getBit(b, i)
+		setBit(out, (i+step)%bitLen, v)
 	}
-	return result
+	return out
 }
 
-func addBytes(a, b []byte) []byte {
-	result := make([]byte, len(a))
-	carry := 0
-	for i := len(a) - 1; i >= 0; i-- {
-		sum := int(a[i]) + int(b[i%len(b)]) + carry
-		result[i] = byte(sum & 0xff)
-		carry = sum >> 8
+// getBit gets the bit at position p (0-indexed from left)
+func getBit(b []byte, p int) int {
+	pByte := p / 8
+	pBit := uint(p % 8)
+	return int((b[pByte] >> (7 - pBit)) & 0x01)
+}
+
+// setBit sets the bit at position p to value v
+func setBit(b []byte, p, v int) {
+	pByte := p / 8
+	pBit := uint(p % 8)
+	if v == 1 {
+		b[pByte] |= byte(1 << (7 - pBit))
 	}
-	// Handle final carry by adding 1 to result
-	if carry > 0 {
-		for i := len(result) - 1; i >= 0 && carry > 0; i-- {
-			sum := int(result[i]) + carry
-			result[i] = byte(sum & 0xff)
-			carry = sum >> 8
+}
+
+// onesComplementAdd performs ones-complement addition of two byte slices
+func onesComplementAdd(n1, n2 []byte) []byte {
+	numBits := len(n1) * 8
+	out := make([]byte, len(n1))
+	carry := 0
+
+	// Add from right to left (least significant bit first)
+	for i := numBits - 1; i >= 0; i-- {
+		n1b := getBit(n1, i)
+		n2b := getBit(n2, i)
+		s := n1b + n2b + carry
+
+		if s == 0 || s == 1 {
+			setBit(out, i, s)
+			carry = 0
+		} else if s == 2 {
+			carry = 1
+		} else if s == 3 {
+			setBit(out, i, 1)
+			carry = 1
 		}
 	}
-	return result
+
+	// Ones-complement: wrap carry around
+	if carry == 1 {
+		carryArray := make([]byte, len(n1))
+		carryArray[len(carryArray)-1] = 1
+		out = onesComplementAdd(out, carryArray)
+	}
+	return out
 }
 
 // aesCBCCTSEncrypt performs AES-CBC encryption with CipherText Stealing.
@@ -280,12 +360,17 @@ func aesCBCCTSEncrypt(key, plaintext []byte) ([]byte, error) {
 	ciphertext := make([]byte, len(plaintext))
 	mode.CryptBlocks(ciphertext, plaintext)
 
-	// CTS: swap last two blocks
+	// CTS: swap last two blocks (need temp buffer to avoid corruption)
 	if len(ciphertext) >= 2*blockSize {
 		lastBlockStart := len(ciphertext) - blockSize
 		secondLastStart := lastBlockStart - blockSize
+		// Save second-to-last block
+		secondLastBlock := make([]byte, blockSize)
+		copy(secondLastBlock, ciphertext[secondLastStart:lastBlockStart])
+		// Move last block to second-to-last position
 		copy(ciphertext[secondLastStart:], ciphertext[lastBlockStart:])
-		copy(ciphertext[lastBlockStart:], ciphertext[secondLastStart:lastBlockStart])
+		// Move saved second-to-last to last position
+		copy(ciphertext[lastBlockStart:], secondLastBlock)
 	}
 
 	// Trim to original length if padded
@@ -297,6 +382,7 @@ func aesCBCCTSEncrypt(key, plaintext []byte) ([]byte, error) {
 }
 
 // aesCBCCTSDecrypt performs AES-CBC decryption with CipherText Stealing.
+// This implementation matches Impacket's basic_decrypt using ECB mode with manual XOR.
 func aesCBCCTSDecrypt(key, ciphertext []byte) ([]byte, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
@@ -309,44 +395,74 @@ func aesCBCCTSDecrypt(key, ciphertext []byte) ([]byte, error) {
 		return nil, errors.New("ciphertext too short")
 	}
 
-	// If exactly one block, standard CBC
+	// If exactly one block, standard AES-ECB decrypt
 	if len(ciphertext) == blockSize {
-		iv := make([]byte, blockSize)
-		mode := cipher.NewCBCDecrypter(block, iv)
-		plaintext := make([]byte, len(ciphertext))
-		mode.CryptBlocks(plaintext, ciphertext)
+		plaintext := make([]byte, blockSize)
+		block.Decrypt(plaintext, ciphertext)
 		return plaintext, nil
 	}
 
-	// CTS mode - need to unswap and pad
-	remainder := len(ciphertext) % blockSize
-	if remainder != 0 {
-		// Pad the ciphertext
-		padding := make([]byte, blockSize-remainder)
-		ciphertext = append(ciphertext, padding...)
+	// Split ciphertext into blocks (last block may be partial)
+	numBlocks := (len(ciphertext) + blockSize - 1) / blockSize
+	cblocks := make([][]byte, numBlocks)
+	for i := 0; i < numBlocks; i++ {
+		start := i * blockSize
+		end := start + blockSize
+		if end > len(ciphertext) {
+			end = len(ciphertext)
+		}
+		cblocks[i] = make([]byte, end-start)
+		copy(cblocks[i], ciphertext[start:end])
+	}
+	lastlen := len(cblocks[numBlocks-1])
+
+	// CBC-decrypt all but the last two blocks
+	prevCblock := make([]byte, blockSize)
+	plaintext := make([]byte, 0, len(ciphertext))
+
+	for i := 0; i < numBlocks-2; i++ {
+		decrypted := make([]byte, blockSize)
+		block.Decrypt(decrypted, cblocks[i])
+		xorBytes(decrypted, decrypted, prevCblock)
+		plaintext = append(plaintext, decrypted...)
+		copy(prevCblock, cblocks[i])
 	}
 
-	// Reverse the CTS swap
-	if len(ciphertext) >= 2*blockSize {
-		lastBlockStart := len(ciphertext) - blockSize
-		secondLastStart := lastBlockStart - blockSize
-		tmp := make([]byte, blockSize)
-		copy(tmp, ciphertext[lastBlockStart:])
-		copy(ciphertext[lastBlockStart:], ciphertext[secondLastStart:lastBlockStart])
-		copy(ciphertext[secondLastStart:], tmp)
+	// Decrypt the second-to-last cipher block
+	// The left side of the decrypted block will be the final block of plaintext
+	// xor'd with the final partial cipher block; the right side will be the omitted bytes
+	bb := make([]byte, blockSize)
+	block.Decrypt(bb, cblocks[numBlocks-2])
+
+	// lastplaintext = bb[:lastlen] XOR cblocks[-1]
+	lastplaintext := make([]byte, lastlen)
+	for i := 0; i < lastlen; i++ {
+		lastplaintext[i] = bb[i] ^ cblocks[numBlocks-1][i]
 	}
 
-	iv := make([]byte, blockSize)
-	mode := cipher.NewCBCDecrypter(block, iv)
-	plaintext := make([]byte, len(ciphertext))
-	mode.CryptBlocks(plaintext, ciphertext)
+	// omitted = bb[lastlen:]
+	omitted := bb[lastlen:]
 
-	// Trim padding
-	if remainder != 0 {
-		plaintext = plaintext[:len(plaintext)-blockSize+remainder]
-	}
+	// Decrypt the final cipher block plus the omitted bytes to get the second-to-last plaintext block
+	finalCipherBlock := make([]byte, blockSize)
+	copy(finalCipherBlock, cblocks[numBlocks-1])
+	copy(finalCipherBlock[lastlen:], omitted)
+
+	decrypted := make([]byte, blockSize)
+	block.Decrypt(decrypted, finalCipherBlock)
+	xorBytes(decrypted, decrypted, prevCblock)
+
+	plaintext = append(plaintext, decrypted...)
+	plaintext = append(plaintext, lastplaintext...)
 
 	return plaintext, nil
+}
+
+// xorBytes XORs a and b into dst. All slices must be the same length.
+func xorBytes(dst, a, b []byte) {
+	for i := range dst {
+		dst[i] = a[i] ^ b[i]
+	}
 }
 
 // AES128Key derives an AES128 key from a password and salt.
@@ -364,13 +480,37 @@ func aesCBCCTSDecrypt(key, ciphertext []byte) ([]byte, error) {
 //	salt = "CORP.LOCALjsmith"
 //
 // This makes AES keys password-specific AND realm-specific, unlike RC4.
+// AES128Key derives an AES128 key from a password and salt using RFC 3962 string-to-key.
 func AES128Key(password, salt string) []byte {
-	return pbkdf2.Key([]byte(password), []byte(salt), PBKDF2Iterations, AES128KeySize, sha1.New)
+	// Step 1: PBKDF2 to get seed
+	seed := pbkdf2.Key([]byte(password), []byte(salt), PBKDF2Iterations, AES128KeySize, sha1.New)
+
+	// Step 2: random-to-key is identity for AES
+	tkey := seed
+
+	// Step 3: DK derivation with constant "kerberos"
+	return dk(tkey, []byte("kerberos"), AES128KeySize)
 }
 
-// AES256Key derives an AES256 key from a password and salt.
+// AES256Key derives an AES256 key from a password and salt using RFC 3962 string-to-key.
+//
+// EDUCATIONAL: RFC 3962 String-to-Key
+//
+// The AES string-to-key function is NOT just PBKDF2! It's:
+//  1. PBKDF2-HMAC-SHA1(password, salt, iterations, seed-size)
+//  2. random-to-key(seed) - identity function for AES
+//  3. DK(key, "kerberos") - derive using constant "kerberos"
+//
+// This final DK step is critical and often missed!
 func AES256Key(password, salt string) []byte {
-	return pbkdf2.Key([]byte(password), []byte(salt), PBKDF2Iterations, AES256KeySize, sha1.New)
+	// Step 1: PBKDF2 to get seed
+	seed := pbkdf2.Key([]byte(password), []byte(salt), PBKDF2Iterations, AES256KeySize, sha1.New)
+
+	// Step 2: random-to-key is identity for AES
+	tkey := seed
+
+	// Step 3: DK derivation with constant "kerberos"
+	return dk(tkey, []byte("kerberos"), AES256KeySize)
 }
 
 // BuildAESSalt constructs the salt for AES key derivation.
@@ -403,13 +543,14 @@ func BuildAESSalt(realm, principal string) string {
 //
 // PAC signatures use HMAC with a derived key:
 //   - Type 16 (HMAC-SHA1-96-AES256): 12-byte truncated HMAC-SHA1
-//   - The key is derived using the checksum key derivation constant
+//   - The key is derived using checksum key derivation (0x99)
+//   - Key usage 17 = KERB_NON_KERB_CKSUM_SALT
 //
 // The checksum provides integrity AND authenticity since only
 // the KDC or service knowing the key can produce a valid signature.
 func HMACSHA1AES256(key, data []byte) ([]byte, error) {
-	// Derive the checksum key (Ki) using key usage for PAC
-	checksumKey := deriveAESKey(key, 17, "kerberos", AES256KeySize) // Key usage 17 = PAC
+	// Derive the checksum key (Ki) using key usage 17 + checksum derivation
+	checksumKey := deriveAESKey(key, 17, "chk", AES256KeySize)
 
 	h := hmac.New(sha1.New, checksumKey)
 	h.Write(data)
@@ -421,7 +562,8 @@ func HMACSHA1AES256(key, data []byte) ([]byte, error) {
 
 // HMACSHA1AES128 computes the HMAC-SHA1-96 checksum for AES128.
 func HMACSHA1AES128(key, data []byte) ([]byte, error) {
-	checksumKey := deriveAESKey(key, 17, "kerberos", AES128KeySize)
+	// Use "chk" (0x99) derivation with key usage 17 for PAC checksums
+	checksumKey := deriveAESKey(key, 17, "chk", AES128KeySize)
 
 	h := hmac.New(sha1.New, checksumKey)
 	h.Write(data)
@@ -455,4 +597,14 @@ func deriveRC4SignKey(key []byte) []byte {
 	h := hmac.New(md5.New, key)
 	h.Write([]byte("signaturekey\x00"))
 	return h.Sum(nil)
+}
+
+// TestCTSDecrypt is an exported wrapper for testing aesCBCCTSDecrypt.
+func TestCTSDecrypt(key, ciphertext []byte) ([]byte, error) {
+	return aesCBCCTSDecrypt(key, ciphertext)
+}
+
+// TestCTSEncrypt is an exported wrapper for testing aesCBCCTSEncrypt.
+func TestCTSEncrypt(key, plaintext []byte) ([]byte, error) {
+	return aesCBCCTSEncrypt(key, plaintext)
 }

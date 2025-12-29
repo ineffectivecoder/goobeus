@@ -33,11 +33,127 @@ import (
 //   - Ticket flags
 //   - Validity times
 //   - Authorization data (PAC!)
+//
+// ASN.1: Ticket ::= [APPLICATION 1] SEQUENCE { ... }
 type Ticket struct {
 	TktVno  int           `asn1:"explicit,tag:0"`
 	Realm   string        `asn1:"generalstring,explicit,tag:1"`
 	SName   PrincipalName `asn1:"explicit,tag:2"`
 	EncPart EncryptedData `asn1:"explicit,tag:3"`
+
+	// RawBytes stores the original ASN.1-encoded ticket bytes from the KDC.
+	// If set, Marshal() will return these bytes instead of re-encoding.
+	// This ensures byte-for-byte compatibility with the KDC's encoding.
+	RawBytes []byte `asn1:"-"`
+}
+
+// marshalTicket wraps Ticket with APPLICATION 1 tag for encoding
+// Must manually construct ASN.1 because Go's asn1 package doesn't properly
+// support GeneralString (tag 0x1b) which Kerberos requires.
+func (t Ticket) Marshal() ([]byte, error) {
+	// If we have raw bytes from the KDC, use them directly
+	// This ensures byte-for-byte compatibility
+	if len(t.RawBytes) > 0 {
+		return t.RawBytes, nil
+	}
+
+	// Helper functions for ASN.1 construction
+	buildLen := func(l int) []byte {
+		if l < 128 {
+			return []byte{byte(l)}
+		} else if l < 256 {
+			return []byte{0x81, byte(l)}
+		}
+		return []byte{0x82, byte(l >> 8), byte(l)}
+	}
+
+	wrapExplicit := func(tag int, data []byte) []byte {
+		result := []byte{byte(0xa0 + tag)}
+		result = append(result, buildLen(len(data))...)
+		return append(result, data...)
+	}
+
+	wrapSeq := func(data []byte) []byte {
+		result := []byte{0x30}
+		result = append(result, buildLen(len(data))...)
+		return append(result, data...)
+	}
+
+	buildGeneralString := func(s string) []byte {
+		data := []byte(s)
+		result := []byte{0x1b} // GeneralString tag
+		result = append(result, buildLen(len(data))...)
+		return append(result, data...)
+	}
+
+	buildInt := func(n int) []byte {
+		if n < 128 {
+			return []byte{0x02, 0x01, byte(n)}
+		} else if n < 256 {
+			return []byte{0x02, 0x02, 0x00, byte(n)}
+		}
+		return []byte{0x02, 0x04, byte(n >> 24), byte(n >> 16), byte(n >> 8), byte(n)}
+	}
+
+	// Build Ticket SEQUENCE {
+	//   [0] tkt-vno INTEGER,
+	//   [1] realm GeneralString,
+	//   [2] sname PrincipalName,
+	//   [3] enc-part EncryptedData
+	// }
+
+	// [0] tkt-vno
+	tktVno := wrapExplicit(0, buildInt(t.TktVno))
+
+	// [1] realm (GeneralString)
+	realm := wrapExplicit(1, buildGeneralString(t.Realm))
+
+	// [2] sname (PrincipalName with GeneralString components)
+	// PrincipalName ::= SEQUENCE { [0] name-type INTEGER, [1] name-string SEQUENCE OF GeneralString }
+	snameTypeBytes := wrapExplicit(0, buildInt(int(t.SName.NameType)))
+	var nameStringContent []byte
+	for _, s := range t.SName.NameString {
+		nameStringContent = append(nameStringContent, buildGeneralString(s)...)
+	}
+	nameStringSeq := wrapSeq(nameStringContent)
+	nameStringBytes := wrapExplicit(1, nameStringSeq)
+	sname := wrapExplicit(2, wrapSeq(append(snameTypeBytes, nameStringBytes...)))
+
+	// [3] enc-part (EncryptedData) - use standard marshaling for this
+	encPartData, err := asn1.Marshal(t.EncPart)
+	if err != nil {
+		return nil, err
+	}
+	encPart := wrapExplicit(3, encPartData)
+
+	// Build inner SEQUENCE
+	inner := append(tktVno, realm...)
+	inner = append(inner, sname...)
+	inner = append(inner, encPart...)
+	ticketSeq := wrapSeq(inner)
+
+	// Wrap in APPLICATION 1
+	result := []byte{0x61} // APPLICATION 1 tag
+	result = append(result, buildLen(len(ticketSeq))...)
+	return append(result, ticketSeq...), nil
+}
+
+// UnmarshalTicket parses a Ticket from APPLICATION 1 wrapped bytes
+func UnmarshalTicket(data []byte) (*Ticket, []byte, error) {
+	var raw asn1.RawValue
+	rest, err := asn1.Unmarshal(data, &raw)
+	if err != nil {
+		return nil, nil, err
+	}
+	if raw.Class != asn1.ClassApplication || raw.Tag != 1 {
+		return nil, nil, asn1.StructuralError{Msg: "not an APPLICATION 1 Ticket"}
+	}
+	var ticket Ticket
+	_, err = asn1.Unmarshal(raw.Bytes, &ticket)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &ticket, rest, nil
 }
 
 // TicketRaw is the raw ASN.1 structure with APPLICATION tag
@@ -107,10 +223,33 @@ type TransitedEncoding struct {
 // This is why Mimikatz and Rubeus can dump tickets that work on
 // other machines - the session key is included in the .kirbi.
 type KRBCred struct {
-	PVNO    int           `asn1:"explicit,tag:0"`
-	MsgType int           `asn1:"explicit,tag:1"`
-	Tickets []Ticket      `asn1:"explicit,tag:2"`
-	EncPart EncryptedData `asn1:"explicit,tag:3"`
+	PVNO       int           `asn1:"explicit,tag:0"`
+	MsgType    int           `asn1:"explicit,tag:1"`
+	TicketsRaw asn1.RawValue `asn1:"explicit,tag:2"` // Raw tickets for flexible parsing
+	EncPart    EncryptedData `asn1:"explicit,tag:3"`
+	Tickets    []Ticket      `asn1:"-"` // Parsed tickets (not directly from ASN.1)
+}
+
+// ParseTickets extracts Ticket structs from TicketsRaw.
+// Handles both APPLICATION 1 wrapped and raw SEQUENCE tickets.
+func (k *KRBCred) ParseTickets() error {
+	if len(k.TicketsRaw.Bytes) == 0 {
+		return nil
+	}
+
+	// TicketsRaw.Bytes contains the SEQUENCE OF Ticket
+	data := k.TicketsRaw.Bytes
+	for len(data) > 0 {
+		tkt, rest, err := UnmarshalTicket(data)
+		if err != nil {
+			return err
+		}
+		if tkt != nil {
+			k.Tickets = append(k.Tickets, *tkt)
+		}
+		data = rest
+	}
+	return nil
 }
 
 // EncKRBCredPart is the encrypted part of KRB-CRED.

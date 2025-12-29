@@ -94,16 +94,42 @@ func NewClient(host string, opts ...Option) *Client {
 		opt(c)
 	}
 
-	// Create HTTP client with NTLM support
-	c.httpClient = &http.Client{
-		Timeout: c.Timeout,
-		Transport: &ntlmssp.Negotiator{
-			RoundTripper: &http.Transport{
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: true, // For lab environments
-				},
-			},
+	// Create HTTP transport with TLS
+	// ADWS on Windows Server typically requires TLS 1.2+
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true, // For lab environments
+			MinVersion:         tls.VersionTLS12,
+			MaxVersion:         tls.VersionTLS13,
 		},
+	}
+
+	// Authentication approach:
+	// 1. If explicit creds provided: use NTLM negotiator
+	// 2. If no creds on Windows: try SSPI for Kerberos/NTLM
+	// 3. Fallback: NTLM negotiator (works for some scenarios)
+	if c.Username != "" && c.Password != "" {
+		// Explicit credentials - use NTLM
+		c.httpClient = &http.Client{
+			Timeout: c.Timeout,
+			Transport: ntlmssp.Negotiator{
+				RoundTripper: transport,
+			},
+		}
+	} else {
+		// No explicit creds - try SSPI first (Windows only)
+		sspiClient, err := createSSPIClient(transport, c.Timeout)
+		if err == nil && sspiClient != nil {
+			c.httpClient = sspiClient
+		} else {
+			// Fallback to NTLM negotiator
+			c.httpClient = &http.Client{
+				Timeout: c.Timeout,
+				Transport: ntlmssp.Negotiator{
+					RoundTripper: transport,
+				},
+			}
+		}
 	}
 
 	return c

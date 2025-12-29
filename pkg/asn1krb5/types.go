@@ -75,6 +75,62 @@ type PrincipalName struct {
 	NameString []string `asn1:"generalstring,explicit,tag:1"`
 }
 
+// Marshal encodes PrincipalName with proper GeneralString (0x1b) encoding.
+// Go's standard asn1 encoder uses PrintableString (0x13) which Kerberos KDCs reject.
+func (pn PrincipalName) Marshal() ([]byte, error) {
+	// Helper functions for ASN.1 construction
+	buildLen := func(l int) []byte {
+		if l < 128 {
+			return []byte{byte(l)}
+		} else if l < 256 {
+			return []byte{0x81, byte(l)}
+		}
+		return []byte{0x82, byte(l >> 8), byte(l)}
+	}
+
+	wrapExplicit := func(tag int, data []byte) []byte {
+		result := []byte{byte(0xa0 + tag)}
+		result = append(result, buildLen(len(data))...)
+		return append(result, data...)
+	}
+
+	wrapSeq := func(data []byte) []byte {
+		result := []byte{0x30}
+		result = append(result, buildLen(len(data))...)
+		return append(result, data...)
+	}
+
+	buildGeneralString := func(s string) []byte {
+		data := []byte(s)
+		result := []byte{0x1b} // GeneralString tag
+		result = append(result, buildLen(len(data))...)
+		return append(result, data...)
+	}
+
+	buildInt := func(n int32) []byte {
+		if n >= 0 && n < 128 {
+			return []byte{0x02, 0x01, byte(n)}
+		} else if n >= 0 && n < 256 {
+			return []byte{0x02, 0x02, 0x00, byte(n)}
+		}
+		return []byte{0x02, 0x04, byte(n >> 24), byte(n >> 16), byte(n >> 8), byte(n)}
+	}
+
+	// [0] name-type INTEGER
+	nameType := wrapExplicit(0, buildInt(pn.NameType))
+
+	// [1] name-string SEQUENCE OF GeneralString
+	var nameStringContent []byte
+	for _, s := range pn.NameString {
+		nameStringContent = append(nameStringContent, buildGeneralString(s)...)
+	}
+	nameString := wrapExplicit(1, wrapSeq(nameStringContent))
+
+	// SEQUENCE { [0] name-type, [1] name-string }
+	inner := append(nameType, nameString...)
+	return wrapSeq(inner), nil
+}
+
 // EncryptedData contains encrypted content.
 //
 // EDUCATIONAL: Encrypted Data Structure

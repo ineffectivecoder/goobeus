@@ -125,6 +125,30 @@ func main() {
 		err = cmdTGTDeleg(cmdArgs)
 	case "enumerate", "enum":
 		err = cmdEnumerate(cmdArgs)
+	case "hash":
+		err = cmdHash(cmdArgs)
+	case "triage":
+		err = cmdTriage(cmdArgs)
+	case "klist":
+		err = cmdKlist(cmdArgs)
+	case "purge":
+		err = cmdPurge(cmdArgs)
+	case "monitor":
+		err = cmdMonitor(cmdArgs)
+	case "harvest":
+		err = cmdHarvest(cmdArgs)
+	case "currentluid":
+		err = cmdCurrentLUID(cmdArgs)
+	case "createnetonly":
+		err = cmdCreateNetOnly(cmdArgs)
+	case "changepw":
+		err = cmdChangepw(cmdArgs)
+	case "dcsync":
+		err = cmdDCSync(cmdArgs)
+	case "rbcd":
+		err = cmdRBCD(cmdArgs)
+	case "constrained":
+		err = cmdConstrained(cmdArgs)
 	case "help":
 		cli.Usage(ExitSuccess)
 	default:

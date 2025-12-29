@@ -93,7 +93,7 @@ func Renew(ctx context.Context, req *RenewRequest) (*RenewResult, error) {
 		return nil, fmt.Errorf("failed to parse TGS-REP: %w", err)
 	}
 
-	decrypted, err := decryptEncPart(tgsRep.EncPart, req.SessionKey, etype, crypto.KeyUsageTGSRepEncPart)
+	decrypted, err := decryptEncPart(tgsRep.EncPart, req.SessionKey, etype, crypto.KeyUsageTGSRepSessionKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decrypt TGS-REP: %w", err)
 	}

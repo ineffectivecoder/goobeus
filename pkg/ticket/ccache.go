@@ -180,8 +180,19 @@ func (cc *CCache) Write(w io.Writer) error {
 		return err
 	}
 
-	// Write empty header for v4
-	if err := binary.Write(w, binary.BigEndian, uint16(0)); err != nil {
+	// Write header for v4 - include time offset tag like Impacket does
+	// Header format: length (2 bytes) + { tag(2) + length(2) + data... }
+	// Tag 1 = DeltaTime, with 8 bytes of data (time_offset + usec_offset)
+	headerData := []byte{
+		0x00, 0x01, // Tag 1 = DeltaTime
+		0x00, 0x08, // Length = 8 bytes
+		0xff, 0xff, 0xff, 0xff, // time_offset = -1 (meaning: use current time)
+		0x00, 0x00, 0x00, 0x00, // usec_offset = 0
+	}
+	if err := binary.Write(w, binary.BigEndian, uint16(len(headerData))); err != nil {
+		return err
+	}
+	if _, err := w.Write(headerData); err != nil {
 		return err
 	}
 
@@ -210,7 +221,12 @@ func (cc *CCache) ToKirbi() (*Kirbi, error) {
 
 // FromKirbi creates a CCache from a Kirbi.
 func FromKirbi(kirbi *Kirbi) (*CCache, error) {
+	// If we have RawBytes but no Cred, we can't convert to ccache
+	// (ccache needs structured credential info with session keys)
 	if kirbi.Cred == nil || len(kirbi.Cred.Tickets) == 0 {
+		if len(kirbi.RawBytes) > 0 {
+			return nil, fmt.Errorf("cannot convert raw KRB-CRED bytes to ccache format (use .kirbi instead)")
+		}
 		return nil, fmt.Errorf("kirbi has no tickets")
 	}
 
@@ -417,7 +433,11 @@ func writeCredential(w io.Writer, c *CCacheCredential) error {
 	if err := binary.Write(w, binary.BigEndian, c.Key.EType); err != nil {
 		return err
 	}
-	if err := writeCountedBytes(w, c.Key.Key); err != nil {
+	// Write key with uint16 length (ccache v4 uses 2-byte lengths for key)
+	if err := binary.Write(w, binary.BigEndian, uint16(len(c.Key.Key))); err != nil {
+		return err
+	}
+	if _, err := w.Write(c.Key.Key); err != nil {
 		return err
 	}
 
@@ -600,10 +620,16 @@ func kirbiToCredential(kirbi *Kirbi, ticketIdx int) (*CCacheCredential, error) {
 		return nil, fmt.Errorf("no credential info for ticket")
 	}
 
-	// Marshal ticket to bytes
-	ticketBytes, err := asn1.MarshalWithParams(ticket, "application,tag:1")
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal ticket: %w", err)
+	// Get ticket bytes - use RawBytes if available (avoids asn1.Marshal issues with GeneralString)
+	var ticketBytes []byte
+	if len(ticket.RawBytes) > 0 {
+		ticketBytes = ticket.RawBytes
+	} else {
+		var err error
+		ticketBytes, err = ticket.Marshal()
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal ticket: %w", err)
+		}
 	}
 
 	cred := &CCacheCredential{
@@ -629,7 +655,7 @@ func kirbiToCredential(kirbi *Kirbi, ticketIdx int) (*CCacheCredential, error) {
 		EndTime:     uint32(info.EndTime.Unix()),
 		RenewTill:   uint32(info.RenewTill.Unix()),
 		IsSKey:      0,
-		TicketFlags: 0, // TODO: convert flags
+		TicketFlags: 0x50e00000, // FORWARDABLE | RENEWABLE | INITIAL | PRE-AUTHENT
 		Ticket:      ticketBytes,
 	}
 

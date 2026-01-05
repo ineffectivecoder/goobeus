@@ -204,8 +204,8 @@ func AskTGTWithContext(ctx context.Context, req *TGTRequest) (*TGTResult, error)
 	}
 	fmt.Printf("[DEBUG] TGT ticket bytes: %d bytes\n", len(rawTktBytes))
 
-	// Build kirbi from the gokrb5 ticket, with raw bytes
-	kirbi, err := buildKirbiFromGokrb5WithRaw(&tgt, &tgtKey, req.Username, rawTktBytes)
+	// Build kirbi from the gokrb5 ticket, with raw bytes and enc-part info
+	kirbi, err := buildKirbiFromGokrb5WithRaw(&tgt, &tgtKey, req.Username, rawTktBytes, &asRep.DecryptedEncPart)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build kirbi: %w", err)
 	}
@@ -228,12 +228,13 @@ func AskTGTWithContext(ctx context.Context, req *TGTRequest) (*TGTResult, error)
 
 // buildKirbiFromGokrb5 converts a gokrb5 ticket to our kirbi format.
 func buildKirbiFromGokrb5(tgt *gokrb5messages.Ticket, key *gokrb5types.EncryptionKey, username string) (*ticket.Kirbi, error) {
-	return buildKirbiFromGokrb5WithRaw(tgt, key, username, nil)
+	return buildKirbiFromGokrb5WithRaw(tgt, key, username, nil, nil)
 }
 
 // buildKirbiFromGokrb5WithRaw converts a gokrb5 ticket to our kirbi format.
 // If rawTktBytes is provided, it will be used as the raw ticket bytes (from KDC).
-func buildKirbiFromGokrb5WithRaw(tgt *gokrb5messages.Ticket, key *gokrb5types.EncryptionKey, username string, rawTktBytes []byte) (*ticket.Kirbi, error) {
+// If encPart is provided, it will be used to populate Flags and times.
+func buildKirbiFromGokrb5WithRaw(tgt *gokrb5messages.Ticket, key *gokrb5types.EncryptionKey, username string, rawTktBytes []byte, encPart *gokrb5messages.EncKDCRepPart) (*ticket.Kirbi, error) {
 	// Get ticket bytes - prefer raw if available
 	var tktBytes []byte
 	var err error
@@ -266,6 +267,22 @@ func buildKirbiFromGokrb5WithRaw(tgt *gokrb5messages.Ticket, key *gokrb5types.En
 		RawBytes: tktBytes, // Use exact KDC bytes when marshaling
 	}
 
+	// Build Flags BitString from encPart if available
+	var flags asn1.BitString
+	var authTime, startTime, endTime, renewTill time.Time
+	if encPart != nil {
+		// Convert flags from gokrb5 format to asn1.BitString
+		flagBytes := encPart.Flags.Bytes
+		flags = asn1.BitString{
+			Bytes:     flagBytes,
+			BitLength: encPart.Flags.BitLength,
+		}
+		authTime = encPart.AuthTime
+		startTime = encPart.StartTime
+		endTime = encPart.EndTime
+		renewTill = encPart.RenewTill
+	}
+
 	// Build credential info with session key (EncKRBCredPart)
 	credInfo := asn1krb5.EncKRBCredPart{
 		TicketInfo: []asn1krb5.KRBCredInfo{
@@ -279,7 +296,12 @@ func buildKirbiFromGokrb5WithRaw(tgt *gokrb5messages.Ticket, key *gokrb5types.En
 					NameType:   asn1krb5.NTPrincipal,
 					NameString: []string{username}, // Client principal name
 				},
-				SRealm: tgt.Realm,
+				Flags:     flags,
+				AuthTime:  authTime,
+				StartTime: startTime,
+				EndTime:   endTime,
+				RenewTill: renewTill,
+				SRealm:    tgt.Realm,
 				SName: asn1krb5.PrincipalName{
 					NameType:   int32(tgt.SName.NameType),
 					NameString: tgt.SName.NameString,
@@ -289,9 +311,10 @@ func buildKirbiFromGokrb5WithRaw(tgt *gokrb5messages.Ticket, key *gokrb5types.En
 	}
 
 	// Marshal credential info for the enc-part
-	credInfoBytes, err := asn1.MarshalWithParams(credInfo, "application,tag:29")
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal cred info: %w", err)
+	// Use our custom marshaling that matches Rubeus exactly (Go's asn1 doesn't handle GeneralString properly)
+	credInfoBytes := ticket.MarshalEncKRBCredPart(&credInfo)
+	if credInfoBytes == nil {
+		return nil, fmt.Errorf("failed to marshal cred info")
 	}
 
 	// Build a complete KRB-CRED manually using raw bytes

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/goobeus/goobeus/pkg/asn1krb5"
 )
@@ -404,13 +405,76 @@ func extractTicketBasicInfo(data []byte, ticket *asn1krb5.Ticket) {
 					ticket.Realm = string(fieldData[2 : 2+strLen])
 				}
 			}
+		} else if tag == 2 { // sname - PrincipalName
+			// PrincipalName ::= SEQUENCE { [0] name-type, [1] name-string SEQUENCE OF GeneralString }
+			// Parse the SEQUENCE
+			if len(fieldData) > 5 && fieldData[0] == 0x30 {
+				seqPos := 2
+				if fieldData[1] >= 0x80 {
+					seqPos = 2 + int(fieldData[1]&0x7f)
+				}
+
+				// Find [1] name-string
+				for seqPos < len(fieldData)-3 {
+					if fieldData[seqPos] == 0xa0 { // [0] name-type
+						// Skip it
+						innerLen := int(fieldData[seqPos+1])
+						if fieldData[seqPos+1] >= 0x80 {
+							innerLen = int(fieldData[seqPos+2])
+							seqPos += 3 + innerLen
+						} else {
+							seqPos += 2 + innerLen
+						}
+					} else if fieldData[seqPos] == 0xa1 { // [1] name-string
+						// This contains SEQUENCE OF GeneralString
+						innerStart := seqPos + 2
+						if fieldData[seqPos+1] >= 0x80 {
+							innerStart = seqPos + 3
+						}
+						if innerStart < len(fieldData) && fieldData[innerStart] == 0x30 {
+							// Skip inner SEQUENCE header
+							stringsStart := innerStart + 2
+							if fieldData[innerStart+1] >= 0x80 {
+								stringsStart = innerStart + 2 + int(fieldData[innerStart+1]&0x7f)
+							}
+
+							// Extract GeneralStrings
+							var nameStrings []string
+							for stringsStart < len(fieldData)-2 {
+								if fieldData[stringsStart] == 0x1b || fieldData[stringsStart] == 0x13 { // GeneralString or PrintableString
+									strLen := int(fieldData[stringsStart+1])
+									if stringsStart+2+strLen <= len(fieldData) {
+										nameStrings = append(nameStrings, string(fieldData[stringsStart+2:stringsStart+2+strLen]))
+										stringsStart += 2 + strLen
+									} else {
+										break
+									}
+								} else {
+									break
+								}
+							}
+							if len(nameStrings) > 0 {
+								ticket.SName = asn1krb5.PrincipalName{
+									NameType:   asn1krb5.NTSrvInst,
+									NameString: nameStrings,
+								}
+							}
+						}
+						break
+					} else {
+						seqPos++
+					}
+				}
+			}
 		} else if tag == 3 { // enc-part
 			// Extract etype from EncryptedData
 			if len(fieldData) > 10 && fieldData[0] == 0x30 {
 				// Skip SEQUENCE header, find [0] etype
 				encPos := 2
-				if fieldData[1] >= 0x80 {
-					encPos += int(fieldData[1]&0x7f) + 1
+				if fieldData[1] == 0x82 {
+					encPos = 4 // 0x30 0x82 LL LL
+				} else if fieldData[1] == 0x81 {
+					encPos = 3 // 0x30 0x81 LL
 				}
 				if encPos < len(fieldData) && fieldData[encPos] == 0xa0 {
 					etypeStart := encPos + 4
@@ -467,13 +531,12 @@ func (k *Kirbi) Marshal() ([]byte, error) {
 
 	// Marshal CredInfo into EncPart if present
 	// EncKRBCredPart uses APPLICATION 29 tag
+	// We use custom marshaling to match Rubeus exactly (Go's asn1 doesn't do GeneralString properly)
 	encPart := k.Cred.EncPart
 	if k.CredInfo != nil && len(encPart.Cipher) == 0 {
-		credInfoData, err := asn1.MarshalWithParams(*k.CredInfo, "application,tag:29")
-		if err == nil {
-			encPart.Cipher = credInfoData
-			encPart.EType = 0 // NULL encryption
-		}
+		credInfoData := MarshalEncKRBCredPart(k.CredInfo)
+		encPart.Cipher = credInfoData
+		encPart.EType = 0 // NULL encryption
 	}
 
 	// Marshal enc-part
@@ -524,6 +587,161 @@ func wrapTLV(tag byte, data []byte) []byte {
 		result = append(result, 0x82, byte(length>>8), byte(length&0xff))
 	}
 	return append(result, data...)
+}
+
+// MarshalEncKRBCredPart encodes EncKRBCredPart exactly like Rubeus does.
+// This is critical for PTT to work - Go's asn1 package doesn't handle GeneralString properly.
+func MarshalEncKRBCredPart(cred *asn1krb5.EncKRBCredPart) []byte {
+	if cred == nil || len(cred.TicketInfo) == 0 {
+		return nil
+	}
+
+	// Marshal KrbCredInfo
+	infoBytes := marshalKRBCredInfo(&cred.TicketInfo[0])
+
+	// ticket-info [0] SEQUENCE OF KrbCredInfo
+	// Structure: [0] -> SEQUENCE OF -> KrbCredInfo
+	// The KrbCredInfo itself is already a SEQUENCE, so we just wrap it in SEQUENCE OF
+	seqOf := wrapSequence(infoBytes)             // SEQUENCE OF containing KrbCredInfo
+	ticketInfoTagged := wrapContextTag(0, seqOf) // [0] tag
+
+	// EncKrbCredPart SEQUENCE
+	totalSeq := wrapSequence(ticketInfoTagged)
+
+	// [APPLICATION 29]
+	return wrapApplication(29, totalSeq)
+}
+
+// marshalKRBCredInfo encodes a single KRBCredInfo exactly like Rubeus.
+func marshalKRBCredInfo(info *asn1krb5.KRBCredInfo) []byte {
+	var elements []byte
+
+	// Helper for GeneralString (0x1b)
+	buildGeneralString := func(s string) []byte {
+		data := []byte(s)
+		result := []byte{0x1b}
+		result = append(result, buildLen(len(data))...)
+		return append(result, data...)
+	}
+
+	// Helper to build INTEGER
+	buildInt := func(n int) []byte {
+		if n == 0 {
+			return []byte{0x02, 0x01, 0x00}
+		}
+		if n > 0 && n < 128 {
+			return []byte{0x02, 0x01, byte(n)}
+		}
+		if n >= 128 && n < 256 {
+			return []byte{0x02, 0x02, 0x00, byte(n)}
+		}
+		// Handle larger values
+		return []byte{0x02, 0x04, byte(n >> 24), byte(n >> 16), byte(n >> 8), byte(n)}
+	}
+
+	// Helper to build GeneralizedTime (yyyyMMddHHmmssZ format)
+	buildGenTime := func(t time.Time) []byte {
+		timeStr := t.UTC().Format("20060102150405Z")
+		data := []byte(timeStr)
+		result := []byte{0x18} // GeneralizedTime tag
+		result = append(result, byte(len(data)))
+		return append(result, data...)
+	}
+
+	// [0] key - EncryptionKey ::= SEQUENCE { [0] keytype INTEGER, [1] keyvalue OCTET STRING }
+	keyTypeBytes := wrapContextTag(0, buildInt(int(info.Key.KeyType)))
+	keyValueBytes := wrapContextTag(1, wrapOctetString(info.Key.KeyValue))
+	keySeq := wrapSequence(append(keyTypeBytes, keyValueBytes...))
+	elements = append(elements, wrapContextTag(0, keySeq)...)
+
+	// [1] prealm (GeneralString) - optional
+	if info.PRealm != "" {
+		elements = append(elements, wrapContextTag(1, buildGeneralString(info.PRealm))...)
+	}
+
+	// [2] pname (PrincipalName) - optional
+	if len(info.PName.NameString) > 0 && info.PName.NameString[0] != "" {
+		pnameBytes := marshalPrincipalName(&info.PName, buildGeneralString)
+		elements = append(elements, wrapContextTag(2, pnameBytes)...)
+	}
+
+	// [3] flags (BIT STRING) - always encode (Rubeus always does)
+	// BIT STRING encoding: tag(1) + length(1) + unused_bits(1) + 4 bytes of flags = 7 bytes
+	flagBytes := make([]byte, 7)
+	flagBytes[0] = 0x03 // BIT STRING tag
+	flagBytes[1] = 0x05 // length 5 (unused_bits byte + 4 flag bytes)
+	flagBytes[2] = 0x00 // unused bits
+	if len(info.Flags.Bytes) >= 4 {
+		// Flags are stored big-endian in BitString
+		copy(flagBytes[3:7], info.Flags.Bytes[:4])
+	}
+	elements = append(elements, wrapContextTag(3, flagBytes)...)
+
+	// [4] authtime - optional
+	if !info.AuthTime.IsZero() {
+		elements = append(elements, wrapContextTag(4, buildGenTime(info.AuthTime))...)
+	}
+
+	// [5] starttime - optional
+	if !info.StartTime.IsZero() {
+		elements = append(elements, wrapContextTag(5, buildGenTime(info.StartTime))...)
+	}
+
+	// [6] endtime - optional
+	if !info.EndTime.IsZero() {
+		elements = append(elements, wrapContextTag(6, buildGenTime(info.EndTime))...)
+	}
+
+	// [7] renew-till - optional
+	if !info.RenewTill.IsZero() {
+		elements = append(elements, wrapContextTag(7, buildGenTime(info.RenewTill))...)
+	}
+
+	// [8] srealm (GeneralString) - optional
+	if info.SRealm != "" {
+		elements = append(elements, wrapContextTag(8, buildGeneralString(info.SRealm))...)
+	}
+
+	// [9] sname (PrincipalName) - optional
+	if len(info.SName.NameString) > 0 && info.SName.NameString[0] != "" {
+		snameBytes := marshalPrincipalName(&info.SName, buildGeneralString)
+		elements = append(elements, wrapContextTag(9, snameBytes)...)
+	}
+
+	// [10] caddr - not used
+
+	return wrapSequence(elements)
+}
+
+// marshalPrincipalName encodes a PrincipalName using GeneralString.
+func marshalPrincipalName(p *asn1krb5.PrincipalName, buildGeneralString func(string) []byte) []byte {
+	// [0] name-type INTEGER
+	nameTypeInt := []byte{0x02, 0x01, byte(p.NameType)}
+	nameType := wrapContextTag(0, nameTypeInt)
+
+	// [1] name-string SEQUENCE OF GeneralString
+	var nameStrings []byte
+	for _, s := range p.NameString {
+		nameStrings = append(nameStrings, buildGeneralString(s)...)
+	}
+	nameString := wrapContextTag(1, wrapSequence(nameStrings))
+
+	return wrapSequence(append(nameType, nameString...))
+}
+
+// wrapOctetString wraps data in an OCTET STRING
+func wrapOctetString(data []byte) []byte {
+	return wrapTLV(0x04, data)
+}
+
+// buildLen creates ASN.1 length encoding
+func buildLen(l int) []byte {
+	if l < 128 {
+		return []byte{byte(l)}
+	} else if l < 256 {
+		return []byte{0x81, byte(l)}
+	}
+	return []byte{0x82, byte(l >> 8), byte(l)}
 }
 
 // ToBytes is an alias for Marshal (for PTT compatibility).

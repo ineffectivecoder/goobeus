@@ -266,6 +266,12 @@ func UnmarshalAPREQ(data []byte) (*APREQ, []byte, error) {
 	}
 
 	headerLen := 1 + outerLenBytes
+
+	// Bounds check to prevent panic
+	if headerLen+outerLen > len(data) {
+		return nil, nil, asn1.StructuralError{Msg: fmt.Sprintf("outer length %d exceeds data length %d", headerLen+outerLen, len(data))}
+	}
+
 	seqData := data[headerLen : headerLen+outerLen]
 	rest := data[headerLen+outerLen:]
 
@@ -275,6 +281,12 @@ func UnmarshalAPREQ(data []byte) (*APREQ, []byte, error) {
 	}
 
 	seqLen, seqLenBytes := parseASN1Length(seqData[1:])
+
+	// Bounds check for sequence content
+	if seqLen < 0 || 1+seqLenBytes+seqLen > len(seqData) {
+		return nil, nil, asn1.StructuralError{Msg: fmt.Sprintf("sequence length %d exceeds available data", seqLen)}
+	}
+
 	seqContent := seqData[1+seqLenBytes : 1+seqLenBytes+seqLen]
 
 	// Now parse the SEQUENCE contents manually
@@ -318,10 +330,27 @@ func UnmarshalAPREQ(data []byte) (*APREQ, []byte, error) {
 		if tktLen < 0 {
 			return nil, nil, asn1.StructuralError{Msg: "invalid ticket length"}
 		}
-		tktInner := ticketBytes[1+tktLenBytes : 1+tktLenBytes+tktLen]
-		_, err = asn1.Unmarshal(tktInner, &ticket)
-		if err != nil {
-			return nil, nil, fmt.Errorf("parsing Ticket inner: %w", err)
+
+		// Bounds check
+		innerStart := 1 + tktLenBytes
+		innerEnd := innerStart + tktLen
+		if innerEnd > len(ticketBytes) {
+			// The APPLICATION 1 length exceeds available data
+			// Try parsing the whole ticketBytes as-is (Go may handle APPLICATION 1)
+			_, err = asn1.UnmarshalWithParams(ticketBytes, &ticket, "application,tag:1")
+			if err != nil {
+				// Last resort: try without the APPLICATION tag hint
+				_, err = asn1.Unmarshal(ticketBytes, &ticket)
+				if err != nil {
+					return nil, nil, fmt.Errorf("parsing Ticket (bounds exceeded): %w", err)
+				}
+			}
+		} else {
+			tktInner := ticketBytes[innerStart:innerEnd]
+			_, err = asn1.Unmarshal(tktInner, &ticket)
+			if err != nil {
+				return nil, nil, fmt.Errorf("parsing Ticket inner: %w", err)
+			}
 		}
 	} else {
 		_, err = asn1.Unmarshal(ticketBytes, &ticket)

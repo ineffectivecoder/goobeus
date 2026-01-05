@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"syscall"
+
+	"golang.org/x/term"
 
 	"github.com/goobeus/goobeus/pkg/adws"
 	"github.com/goobeus/goobeus/pkg/client"
@@ -17,6 +20,42 @@ import (
 	"github.com/goobeus/goobeus/pkg/ticket"
 )
 
+// promptPassword securely prompts for a password without echoing to terminal.
+func promptPassword(prompt string) (string, error) {
+	fmt.Print(prompt)
+	password, err := term.ReadPassword(int(syscall.Stdin))
+	fmt.Println() // Print newline after password entry
+	if err != nil {
+		return "", fmt.Errorf("failed to read password: %w", err)
+	}
+	return string(password), nil
+}
+
+// ensureCredentials checks if credentials are available, prompting if needed.
+// Returns an error only if credentials cannot be obtained.
+func ensureCredentials() error {
+	// If we already have credentials, nothing to do
+	if flags.password != "" || flags.ntHash != "" || flags.aes256 != "" {
+		return nil
+	}
+
+	// If no username, we can't prompt (don't know who to auth as)
+	if flags.username == "" {
+		return nil // Let the command handle this error
+	}
+
+	// Prompt for password
+	password, err := promptPassword(fmt.Sprintf("Password for %s: ", flags.username))
+	if err != nil {
+		return err
+	}
+	if password == "" {
+		return fmt.Errorf("password cannot be empty")
+	}
+	flags.password = password
+	return nil
+}
+
 // cmdAskTGT handles the asktgt command.
 func cmdAskTGT(args []string) error {
 	if flags.domain == "" {
@@ -25,8 +64,10 @@ func cmdAskTGT(args []string) error {
 	if flags.username == "" {
 		return fmt.Errorf("username is required (-u)")
 	}
-	if flags.password == "" && flags.ntHash == "" && flags.aes256 == "" {
-		return fmt.Errorf("credentials required (-p, --rc4, or --aes256)")
+
+	// Prompt for password if no credentials provided
+	if err := ensureCredentials(); err != nil {
+		return err
 	}
 
 	req := &client.TGTRequest{
@@ -342,7 +383,7 @@ func cmdDiamond(args []string) error {
 // cmdSapphire handles sapphire ticket forging.
 func cmdSapphire(args []string) error {
 	fs := flag.NewFlagSet("sapphire", flag.ExitOnError)
-	var domainSID, impersonate, krbtgtHash, krbtgtAES string
+	var domainSID, impersonate, krbtgtHash, krbtgtAES, outfile string
 	var userID uint
 
 	fs.StringVar(&domainSID, "domain-sid", "", "Domain SID (S-1-5-21-...)")
@@ -350,7 +391,14 @@ func cmdSapphire(args []string) error {
 	fs.StringVar(&krbtgtHash, "nthash", "", "krbtgt NT hash (for signing)")
 	fs.StringVar(&krbtgtAES, "aeskey", "", "krbtgt AES256 key (for signing)")
 	fs.UintVar(&userID, "user-id", 0, "User ID for PAC_REQUESTOR (KB5008380)")
+	fs.StringVar(&outfile, "o", "", "Output file (.kirbi or .ccache)")
+	fs.StringVar(&outfile, "out", "", "Output file (.kirbi or .ccache)")
 	fs.Parse(args)
+
+	// Override global outfile if local one specified
+	if outfile != "" {
+		flags.outfile = outfile
+	}
 
 	if impersonate == "" {
 		return fmt.Errorf("--impersonate (user to steal PAC from) is required")
@@ -415,6 +463,11 @@ func cmdSapphire(args []string) error {
 		req.TGT = kirbi
 		if kirbi.SessionKey() != nil {
 			req.SessionKey = kirbi.SessionKey().KeyValue
+		}
+	} else {
+		// Prompt for password if no TGT and no credentials provided
+		if err := ensureCredentials(); err != nil {
+			return err
 		}
 	}
 
@@ -892,8 +945,10 @@ func loadTicket() (*ticket.Kirbi, []byte, error) {
 		if flags.domain == "" || flags.username == "" {
 			return nil, nil, fmt.Errorf("ticket or credentials required")
 		}
-		if flags.password == "" && flags.ntHash == "" && flags.aes256 == "" {
-			return nil, nil, fmt.Errorf("credentials required")
+
+		// Prompt for password if no credentials provided
+		if err := ensureCredentials(); err != nil {
+			return nil, nil, err
 		}
 
 		req := &client.TGTRequest{
@@ -957,7 +1012,11 @@ func outputTicket(kirbi *ticket.Kirbi) error {
 	}
 
 	// Default to kirbi format
-	return ticket.SaveKirbi(kirbi, flags.outfile)
+	if err := ticket.SaveKirbi(kirbi, flags.outfile); err != nil {
+		return err
+	}
+	fmt.Printf("[+] Saved as kirbi: %s\n", flags.outfile)
+	return nil
 }
 
 func hexDecode(s string) []byte {
@@ -1244,8 +1303,10 @@ func cmdDCSync(args []string) error {
 	if flags.username == "" {
 		return fmt.Errorf("-u (username) is required")
 	}
-	if flags.password == "" && flags.ntHash == "" {
-		return fmt.Errorf("-p (password) or --hash (NTLM hash) is required")
+
+	// Prompt for password if no credentials provided
+	if err := ensureCredentials(); err != nil {
+		return err
 	}
 
 	// Auto-detect DC if not specified

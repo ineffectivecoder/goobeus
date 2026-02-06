@@ -344,11 +344,16 @@ func readCredential(r io.Reader, version uint16) (*CCacheCredential, error) {
 			return nil, err
 		}
 	}
-	keyLen, err := readCountedBytes(r)
-	if err != nil {
+	// Key length is uint16 in ccache format (unlike ticket which uses uint32)
+	var keyLen uint16
+	if err := binary.Read(r, binary.BigEndian, &keyLen); err != nil {
 		return nil, err
 	}
-	c.Key.Key = keyLen
+	keyData := make([]byte, keyLen)
+	if _, err := io.ReadFull(r, keyData); err != nil {
+		return nil, err
+	}
+	c.Key.Key = keyData
 
 	// Read times
 	if err := binary.Read(r, binary.BigEndian, &c.AuthTime); err != nil {
@@ -433,7 +438,7 @@ func writeCredential(w io.Writer, c *CCacheCredential) error {
 	if err := binary.Write(w, binary.BigEndian, c.Key.EType); err != nil {
 		return err
 	}
-	// Write key with uint16 length (ccache v4 uses 2-byte lengths for key)
+	// Write key with uint16 length (MIT ccache format)
 	if err := binary.Write(w, binary.BigEndian, uint16(len(c.Key.Key))); err != nil {
 		return err
 	}

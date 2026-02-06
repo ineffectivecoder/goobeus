@@ -17,6 +17,7 @@ import (
 	"github.com/goobeus/goobeus/pkg/dcsync"
 	"github.com/goobeus/goobeus/pkg/delegation"
 	"github.com/goobeus/goobeus/pkg/forge"
+	"github.com/goobeus/goobeus/pkg/pac"
 	"github.com/goobeus/goobeus/pkg/ticket"
 )
 
@@ -663,8 +664,10 @@ func cmdDescribe(args []string) error {
 	}
 
 	// If key provided, set it for decryption
+	var keyBytes []byte
+	var keyType int
 	if keyStr != "" {
-		keyBytes, err := hex.DecodeString(keyStr)
+		keyBytes, err = hex.DecodeString(keyStr)
 		if err != nil {
 			return fmt.Errorf("invalid key hex: %w", err)
 		}
@@ -672,18 +675,39 @@ func cmdDescribe(args []string) error {
 		// Determine key type from length
 		switch len(keyBytes) {
 		case 16:
-			kirbi.DecryptKeyType = 17 // AES128
+			keyType = 17 // AES128
+			kirbi.DecryptKeyType = keyType
 		case 32:
-			kirbi.DecryptKeyType = 18 // AES256
+			keyType = 18 // AES256
+			kirbi.DecryptKeyType = keyType
 		default:
-			kirbi.DecryptKeyType = 23 // RC4/NTLM
+			keyType = 23 // RC4/NTLM
+			kirbi.DecryptKeyType = keyType
 		}
-		fmt.Printf("[*] Using provided key for decryption (%d bytes, etype %d)\n", len(keyBytes), kirbi.DecryptKeyType)
+		fmt.Printf("[*] Using provided key for decryption (%d bytes, etype %d)\n", len(keyBytes), keyType)
 	}
 
 	// Use ticket viewer
 	view := ticket.ViewTicket(kirbi, ticket.ViewOptions{Verbose: flags.verbose, DecryptKey: kirbi.DecryptKey})
 	fmt.Println(view.String())
+
+	// If key provided, try to decrypt ticket and decode PAC
+	if len(keyBytes) > 0 && kirbi.Ticket() != nil {
+		fmt.Println("[*] Attempting to decrypt ticket and decode PAC...")
+		pacData, err := decryptTicketAndExtractPAC(kirbi, keyBytes, keyType)
+		if err != nil {
+			fmt.Printf("[!] PAC extraction failed: %v\n", err)
+		} else if len(pacData) > 0 {
+			// Decode PAC and show group memberships
+			decoded, err := decodePACForDisplay(pacData)
+			if err != nil {
+				fmt.Printf("[!] PAC decode failed: %v\n", err)
+			} else {
+				fmt.Println(decoded)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -1491,4 +1515,210 @@ func printDCSyncResult(result *dcsync.DCSyncResult, targetUser string) {
 		}
 	}
 	fmt.Println("───────────────────────────────────────────────────────────────")
+}
+
+// decryptTicketAndExtractPAC decrypts a ticket with the provided key and extracts the PAC.
+func decryptTicketAndExtractPAC(kirbi *ticket.Kirbi, key []byte, etype int) ([]byte, error) {
+	if kirbi == nil || kirbi.Ticket() == nil {
+		return nil, fmt.Errorf("no ticket to decrypt")
+	}
+
+	// Get raw ticket bytes
+	var ticketRaw []byte
+	if len(kirbi.Cred.Tickets[0].RawBytes) > 0 {
+		ticketRaw = kirbi.Cred.Tickets[0].RawBytes
+	} else {
+		var err error
+		ticketRaw, err = kirbi.Cred.Tickets[0].Marshal()
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal ticket: %w", err)
+		}
+	}
+
+	// Extract enc-part cipher from ticket
+	cipher, err := extractCipherFromTicket(ticketRaw)
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract cipher: %w", err)
+	}
+
+	// Decrypt with the provided key (key usage 2 for TGT)
+	var plaintext []byte
+	switch etype {
+	case 18: // AES256
+		plaintext, err = crypto.DecryptAES(key, cipher, 2, etype)
+	case 17: // AES128
+		plaintext, err = crypto.DecryptAES(key, cipher, 2, etype)
+	case 23: // RC4
+		plaintext, err = crypto.DecryptRC4(key, cipher, 2)
+	default:
+		return nil, fmt.Errorf("unsupported etype: %d", etype)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("decryption failed: %w", err)
+	}
+
+	// Find PAC in the decrypted EncTicketPart
+	pacData := findPACInEncTicketPart(plaintext)
+	if len(pacData) == 0 {
+		return nil, fmt.Errorf("no PAC found in decrypted ticket")
+	}
+
+	return pacData, nil
+}
+
+// extractCipherFromTicket extracts the encrypted part from a raw ticket.
+func extractCipherFromTicket(data []byte) ([]byte, error) {
+	// Ticket ::= APPLICATION 1 { tkt-vno, realm, sname, enc-part }
+	// We need to find the enc-part and extract its cipher field
+
+	if len(data) < 20 || data[0] != 0x61 { // APPLICATION 1
+		return nil, fmt.Errorf("not a valid ticket")
+	}
+
+	// Skip APPLICATION 1 header
+	pos := 2
+	if data[1] == 0x82 {
+		pos = 4
+	} else if data[1] == 0x81 {
+		pos = 3
+	}
+
+	// Skip SEQUENCE header
+	if data[pos] == 0x30 {
+		if data[pos+1] == 0x82 {
+			pos += 4
+		} else if data[pos+1] == 0x81 {
+			pos += 3
+		} else {
+			pos += 2
+		}
+	}
+
+	// Find [3] enc-part
+	for pos < len(data) {
+		if data[pos] < 0xa0 {
+			break
+		}
+		tag := int(data[pos] - 0xa0)
+		fieldLen := 0
+		contentPos := pos + 2
+		if data[pos+1] == 0x82 {
+			fieldLen = (int(data[pos+2]) << 8) | int(data[pos+3])
+			contentPos = pos + 4
+		} else if data[pos+1] == 0x81 {
+			fieldLen = int(data[pos+2])
+			contentPos = pos + 3
+		} else if data[pos+1] < 0x80 {
+			fieldLen = int(data[pos+1])
+		}
+
+		if tag == 3 { // enc-part
+			// Parse EncryptedData SEQUENCE to get cipher
+			encData := data[contentPos : contentPos+fieldLen]
+			return extractCipherFromEncryptedData(encData)
+		}
+
+		pos = contentPos + fieldLen
+	}
+
+	return nil, fmt.Errorf("enc-part not found")
+}
+
+// extractCipherFromEncryptedData extracts cipher from EncryptedData structure.
+func extractCipherFromEncryptedData(data []byte) ([]byte, error) {
+	// EncryptedData ::= SEQUENCE { etype [0], kvno [1], cipher [2] }
+	if len(data) < 10 || data[0] != 0x30 {
+		return nil, fmt.Errorf("invalid EncryptedData")
+	}
+
+	pos := 2
+	if data[1] == 0x82 {
+		pos = 4
+	} else if data[1] == 0x81 {
+		pos = 3
+	}
+
+	// Find [2] cipher
+	for pos < len(data) {
+		if data[pos] < 0xa0 {
+			break
+		}
+		tag := int(data[pos] - 0xa0)
+		fieldLen := 0
+		contentPos := pos + 2
+		if data[pos+1] == 0x82 {
+			fieldLen = (int(data[pos+2]) << 8) | int(data[pos+3])
+			contentPos = pos + 4
+		} else if data[pos+1] == 0x81 {
+			fieldLen = int(data[pos+2])
+			contentPos = pos + 3
+		} else if data[pos+1] < 0x80 {
+			fieldLen = int(data[pos+1])
+		}
+
+		if tag == 2 { // cipher
+			cipherData := data[contentPos : contentPos+fieldLen]
+			// Skip OCTET STRING header if present
+			if len(cipherData) > 2 && cipherData[0] == 0x04 {
+				if cipherData[1] == 0x82 {
+					return cipherData[4:], nil
+				} else if cipherData[1] == 0x81 {
+					return cipherData[3:], nil
+				} else if cipherData[1] < 0x80 {
+					return cipherData[2:], nil
+				}
+			}
+			return cipherData, nil
+		}
+
+		pos = contentPos + fieldLen
+	}
+
+	return nil, fmt.Errorf("cipher not found in EncryptedData")
+}
+
+// findPACInEncTicketPart finds PAC bytes in decrypted EncTicketPart.
+func findPACInEncTicketPart(data []byte) []byte {
+	// PAC starts with: cBuffers (4 bytes, small number) + version (4 bytes, 0)
+	for i := 0; i < len(data)-8; i++ {
+		// Look for OCTET STRING followed by PAC header
+		if data[i] == 0x04 && i+4 < len(data) {
+			contentStart := i + 2
+			if data[i+1] == 0x82 {
+				contentStart = i + 4
+			} else if data[i+1] == 0x81 {
+				contentStart = i + 3
+			}
+
+			if contentStart+8 < len(data) {
+				cBuffers := int(data[contentStart]) | int(data[contentStart+1])<<8
+				version := int(data[contentStart+4]) | int(data[contentStart+5])<<8
+
+				if cBuffers >= 1 && cBuffers <= 20 && version == 0 {
+					// Found PAC, extract it
+					octetLen := 0
+					if data[i+1] == 0x82 {
+						octetLen = int(data[i+2])<<8 | int(data[i+3])
+					} else if data[i+1] == 0x81 {
+						octetLen = int(data[i+2])
+					} else {
+						octetLen = int(data[i+1])
+					}
+					if contentStart+octetLen <= len(data) {
+						return data[contentStart : contentStart+octetLen]
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// decodePACForDisplay decodes PAC and returns human-readable string.
+func decodePACForDisplay(pacData []byte) (string, error) {
+	decoded, err := pac.DecodePAC(pacData)
+	if err != nil {
+		return "", err
+	}
+	return decoded.String(), nil
 }

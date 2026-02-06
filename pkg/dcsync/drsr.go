@@ -38,6 +38,7 @@ type DRSRClient struct {
 	client    drsuapi.DrsuapiClient
 	drsHandle *drsuapi.Handle
 	domainDN  string
+	domain    string // DNS domain name for UPN lookups
 }
 
 // NewDRSRClient creates a new DRSR client connected to the DC.
@@ -92,6 +93,7 @@ func NewDRSRClient(ctx context.Context, req *DCSyncRequest) (*DRSRClient, error)
 		conn:     cc,
 		client:   client,
 		domainDN: domainDN,
+		domain:   req.Domain,
 	}, nil
 }
 
@@ -135,13 +137,11 @@ func (c *DRSRClient) Bind(ctx context.Context) error {
 // CrackName resolves a SAMAccountName to GUID using DsCrackNames.
 // Based on official go-msrpc example.
 func (c *DRSRClient) CrackName(ctx context.Context, name string) (string, error) {
-	// Extract NETBIOS domain from DN (DC=rootshell,DC=ninja -> ROOTSHELL)
-	domainPart := strings.Split(c.domainDN, ",")[0] // "DC=rootshell"
-	netbiosDomain := strings.ToUpper(strings.TrimPrefix(domainPart, "DC="))
-
-	// Use NT4 format: DOMAIN\username
-	nt4Name := fmt.Sprintf("%s\\%s", netbiosDomain, name)
-	fmt.Printf("[*] CrackNames lookup: %s\n", nt4Name)
+	// Use UPN format: user@domain.com
+	// This is more reliable than NT4 format (DOMAIN\user) because we know
+	// the DNS domain but not necessarily the NETBIOS domain name
+	upn := fmt.Sprintf("%s@%s", name, strings.ToLower(c.domain))
+	fmt.Printf("[*] CrackNames lookup: %s\n", upn)
 
 	resp, err := c.client.CrackNames(ctx, &drsuapi.CrackNamesRequest{
 		Handle:    c.drsHandle,
@@ -149,8 +149,8 @@ func (c *DRSRClient) CrackName(ctx context.Context, name string) (string, error)
 		In: &drsuapi.MessageCrackNamesRequest{
 			Value: &drsuapi.MessageCrackNamesRequest_V1{
 				V1: &drsuapi.MessageCrackNamesRequestV1{
-					FormatOffered: uint32(drsuapi.DSNameFormatNT4AccountName), // DOMAIN\user format
-					Names:         []string{nt4Name},
+					FormatOffered: uint32(drsuapi.DSNameFormatUserPrincipalName), // user@domain format
+					Names:         []string{upn},
 					FormatDesired: uint32(drsuapi.DSNameFormatUniqueIDName),
 				},
 			},

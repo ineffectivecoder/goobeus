@@ -232,6 +232,7 @@ type KRBCred struct {
 
 // ParseTickets extracts Ticket structs from TicketsRaw.
 // Handles both APPLICATION 1 wrapped and raw SEQUENCE tickets.
+// Even if ASN.1 parsing fails (due to GeneralString), we preserve RawBytes.
 func (k *KRBCred) ParseTickets() error {
 	if len(k.TicketsRaw.Bytes) == 0 {
 		return nil
@@ -240,16 +241,198 @@ func (k *KRBCred) ParseTickets() error {
 	// TicketsRaw.Bytes contains the SEQUENCE OF Ticket
 	data := k.TicketsRaw.Bytes
 	for len(data) > 0 {
+		// Try standard unmarshaling first
 		tkt, rest, err := UnmarshalTicket(data)
-		if err != nil {
-			return err
-		}
-		if tkt != nil {
+		if err == nil && tkt != nil {
 			k.Tickets = append(k.Tickets, *tkt)
+			data = rest
+			continue
 		}
-		data = rest
+
+		// Standard parsing failed - likely due to GeneralString (0x1b)
+		// Manually extract the ticket and preserve raw bytes
+		if len(data) < 5 || data[0] != 0x61 { // APPLICATION 1
+			break
+		}
+
+		// Calculate ticket length
+		ticketLen := 0
+		headerLen := 2
+		if data[1] == 0x82 {
+			ticketLen = (int(data[2]) << 8) | int(data[3])
+			headerLen = 4
+		} else if data[1] == 0x81 {
+			ticketLen = int(data[2])
+			headerLen = 3
+		} else if data[1] < 0x80 {
+			ticketLen = int(data[1])
+		} else {
+			break
+		}
+
+		if headerLen+ticketLen > len(data) {
+			break
+		}
+
+		ticketBytes := data[:headerLen+ticketLen]
+		ticket := Ticket{
+			TktVno:   5,
+			RawBytes: ticketBytes,
+		}
+
+		// Extract basic info from raw bytes (realm, sname, etype)
+		extractTicketInfo(ticketBytes, &ticket)
+
+		k.Tickets = append(k.Tickets, ticket)
+		data = data[headerLen+ticketLen:]
 	}
+
 	return nil
+}
+
+// extractTicketInfo extracts realm, sname, and etype from raw ticket bytes.
+// This is a fallback when Go's asn1 parser fails on GeneralString.
+func extractTicketInfo(data []byte, ticket *Ticket) {
+	if len(data) < 20 || data[0] != 0x61 { // APPLICATION 1
+		return
+	}
+
+	// Skip APPLICATION 1 header
+	pos := 2
+	if data[1] == 0x82 {
+		pos = 4
+	} else if data[1] == 0x81 {
+		pos = 3
+	}
+
+	// Skip SEQUENCE header
+	if pos < len(data) && data[pos] == 0x30 {
+		if data[pos+1] == 0x82 {
+			pos += 4
+		} else if data[pos+1] == 0x81 {
+			pos += 3
+		} else {
+			pos += 2
+		}
+	}
+
+	// Parse fields: [0] tkt-vno, [1] realm, [2] sname, [3] enc-part
+	for pos < len(data) {
+		if data[pos] < 0xa0 {
+			break
+		}
+		tag := int(data[pos] - 0xa0)
+		fieldLen := 0
+		contentPos := pos + 2
+		if pos+1 < len(data) && data[pos+1] == 0x82 {
+			if pos+3 < len(data) {
+				fieldLen = (int(data[pos+2]) << 8) | int(data[pos+3])
+			}
+			contentPos = pos + 4
+		} else if pos+1 < len(data) && data[pos+1] == 0x81 {
+			if pos+2 < len(data) {
+				fieldLen = int(data[pos+2])
+			}
+			contentPos = pos + 3
+		} else if pos+1 < len(data) && data[pos+1] < 0x80 {
+			fieldLen = int(data[pos+1])
+		}
+
+		if contentPos+fieldLen > len(data) {
+			break
+		}
+
+		fieldData := data[contentPos : contentPos+fieldLen]
+
+		switch tag {
+		case 1: // realm - GeneralString (0x1b) or PrintableString (0x13)
+			if len(fieldData) > 2 && (fieldData[0] == 0x1b || fieldData[0] == 0x13) {
+				strLen := int(fieldData[1])
+				if 2+strLen <= len(fieldData) {
+					ticket.Realm = string(fieldData[2 : 2+strLen])
+				}
+			}
+		case 2: // sname - PrincipalName
+			extractPrincipalName(fieldData, &ticket.SName)
+		case 3: // enc-part - EncryptedData
+			extractEncryptedData(fieldData, &ticket.EncPart)
+		}
+
+		pos = contentPos + fieldLen
+	}
+}
+
+// extractPrincipalName extracts a PrincipalName from raw bytes.
+func extractPrincipalName(data []byte, pn *PrincipalName) {
+	if len(data) < 5 || data[0] != 0x30 {
+		return
+	}
+
+	seqPos := 2
+	if data[1] >= 0x80 {
+		seqPos = 2 + int(data[1]&0x7f)
+	}
+
+	for seqPos < len(data)-3 {
+		if data[seqPos] == 0xa0 { // [0] name-type
+			innerLen := int(data[seqPos+1])
+			if seqPos+2+innerLen <= len(data) && data[seqPos+2] == 0x02 && innerLen >= 3 {
+				pn.NameType = int32(data[seqPos+4])
+			}
+			seqPos += 2 + innerLen
+		} else if data[seqPos] == 0xa1 { // [1] name-string
+			innerStart := seqPos + 2
+			if data[seqPos+1] >= 0x80 {
+				innerStart = seqPos + 3
+			}
+			if innerStart < len(data) && data[innerStart] == 0x30 {
+				stringsStart := innerStart + 2
+				if data[innerStart+1] >= 0x80 {
+					stringsStart = innerStart + 2 + int(data[innerStart+1]&0x7f)
+				}
+				for stringsStart < len(data)-2 {
+					if data[stringsStart] == 0x1b || data[stringsStart] == 0x13 {
+						strLen := int(data[stringsStart+1])
+						if stringsStart+2+strLen <= len(data) {
+							pn.NameString = append(pn.NameString, string(data[stringsStart+2:stringsStart+2+strLen]))
+							stringsStart += 2 + strLen
+						} else {
+							break
+						}
+					} else {
+						break
+					}
+				}
+			}
+			break
+		} else {
+			seqPos++
+		}
+	}
+}
+
+// extractEncryptedData extracts etype from EncryptedData.
+func extractEncryptedData(data []byte, enc *EncryptedData) {
+	if len(data) < 10 || data[0] != 0x30 {
+		return
+	}
+
+	encPos := 2
+	if data[1] == 0x82 {
+		encPos = 4
+	} else if data[1] == 0x81 {
+		encPos = 3
+	}
+
+	if encPos < len(data) && data[encPos] == 0xa0 {
+		// [0] etype
+		if encPos+4 < len(data) && data[encPos+2] == 0x02 {
+			etypeLen := int(data[encPos+3])
+			if etypeLen == 1 && encPos+4 < len(data) {
+				enc.EType = int32(data[encPos+4])
+			}
+		}
+	}
 }
 
 // EncKRBCredPart is the encrypted part of KRB-CRED.

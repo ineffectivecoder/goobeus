@@ -211,12 +211,29 @@ func (cc *CCache) Write(w io.Writer) error {
 	return nil
 }
 
-// ToKirbi converts the first credential to a Kirbi.
+// ToKirbi converts the first real credential to a Kirbi.
+// Skips X-CACHECONF metadata entries.
 func (cc *CCache) ToKirbi() (*Kirbi, error) {
 	if len(cc.Credentials) == 0 {
 		return nil, fmt.Errorf("no credentials in ccache")
 	}
-	return credentialToKirbi(&cc.Credentials[0])
+
+	// Find first real credential (skip X-CACHECONF config entries)
+	for i := range cc.Credentials {
+		cred := &cc.Credentials[i]
+		// X-CACHECONF entries have realm "X-CACHECONF:" and are metadata, not real tickets
+		if cred.Server.Realm == "X-CACHECONF:" {
+			continue
+		}
+		// Also skip if server component starts with "krb5_ccache_conf_data"
+		if len(cred.Server.Components) > 0 && len(cred.Server.Components[0]) > 20 &&
+			cred.Server.Components[0][:20] == "krb5_ccache_conf_dat" {
+			continue
+		}
+		return credentialToKirbi(cred)
+	}
+
+	return nil, fmt.Errorf("no real credentials in ccache (only config entries)")
 }
 
 // FromKirbi creates a CCache from a Kirbi.
@@ -555,15 +572,26 @@ func writeCountedBytes(w io.Writer, data []byte) error {
 
 // credentialToKirbi converts a ccache credential to Kirbi format.
 func credentialToKirbi(cred *CCacheCredential) (*Kirbi, error) {
-	// Parse the raw ticket bytes as ASN.1 Ticket
-	var ticket asn1krb5.Ticket
-	_, err := asn1.UnmarshalWithParams(cred.Ticket, &ticket, "application,tag:1")
-	if err != nil {
-		// Try without application tag
-		_, err = asn1.Unmarshal(cred.Ticket, &ticket)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse ticket: %w", err)
-		}
+	// The ticket bytes from ccache are the raw DER-encoded Ticket (APPLICATION 1)
+	// Go's asn1 package fails on GeneralString (0x1b) in tickets, so we store raw bytes
+	// and extract basic info manually (like we do in manualParseKRBCred)
+
+	ticket := asn1krb5.Ticket{
+		TktVno:   5,
+		RawBytes: cred.Ticket,
+	}
+
+	// Extract realm and sname from the ticket bytes for display purposes
+	if len(cred.Ticket) > 10 && cred.Ticket[0] == 0x61 {
+		extractTicketBasicInfo(cred.Ticket, &ticket)
+	}
+
+	// If extraction failed, use server principal from ccache credential
+	if ticket.Realm == "" {
+		ticket.Realm = cred.Server.Realm
+	}
+	if len(ticket.SName.NameString) == 0 {
+		ticket.SName = principalToASN1(cred.Server)
 	}
 
 	// Create credential info with session key
@@ -582,14 +610,9 @@ func credentialToKirbi(cred *CCacheCredential) (*Kirbi, error) {
 				RenewTill: time.Unix(int64(cred.RenewTill), 0),
 				SRealm:    cred.Server.Realm,
 				SName:     principalToASN1(cred.Server),
+				Flags:     ccacheFlagsToASN1(cred.TicketFlags),
 			},
 		},
-	}
-
-	// Encode EncKRBCredPart
-	encPartData, err := asn1.MarshalWithParams(credInfo, "application,tag:29")
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal cred info: %w", err)
 	}
 
 	// Create KRB-CRED
@@ -598,8 +621,8 @@ func credentialToKirbi(cred *CCacheCredential) (*Kirbi, error) {
 		MsgType: asn1krb5.MsgTypeKRBCred,
 		Tickets: []asn1krb5.Ticket{ticket},
 		EncPart: asn1krb5.EncryptedData{
-			EType:  0, // NULL encryption
-			Cipher: encPartData,
+			EType:  0,   // NULL encryption
+			Cipher: nil, // Will be set by Marshal()
 		},
 	}
 
@@ -607,6 +630,14 @@ func credentialToKirbi(cred *CCacheCredential) (*Kirbi, error) {
 		Cred:     krbCred,
 		CredInfo: credInfo,
 	}, nil
+}
+
+// ccacheFlagsToASN1 converts ccache ticket flags to ASN.1 BitString.
+func ccacheFlagsToASN1(flags uint32) asn1.BitString {
+	return asn1.BitString{
+		Bytes:     []byte{byte(flags >> 24), byte(flags >> 16), byte(flags >> 8), byte(flags)},
+		BitLength: 32,
+	}
 }
 
 // kirbiToCredential converts a Kirbi ticket to ccache credential.

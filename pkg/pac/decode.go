@@ -20,11 +20,21 @@ type DecodedPAC struct {
 	Groups    []string
 	ExtraSIDs []string
 
+	// S4U2Self detection fields
+	UserFlags          uint32 // LOGON_EXTRA_SIDS=32, LOGON_RESOURCE_GROUPS=512
+	ResourceGroupCount int
+	ResourceGroupIDs   []uint32
+	ResourceDomainSID  string
+
 	// Well-known group analysis
 	IsDomainAdmin     bool
 	IsEnterpriseAdmin bool
 	IsSchemaAdmin     bool
 	IsBuiltinAdmin    bool
+
+	// S4U2Self indicators
+	HasServiceAssertedIdentity bool // S-1-18-2 present
+	HasAuthAssertedIdentity    bool // S-1-18-1 present
 
 	// Raw data for debugging
 	LogonInfoSize int
@@ -82,6 +92,18 @@ func DecodePAC(pacData []byte) (*DecodedPAC, error) {
 		result.DomainSID = domainSID.String()
 	}
 
+	// Parse UserFlags from KERB_VALIDATION_INFO
+	// UserFlags is at offset 24 in the NDR body (after referent header)
+	// Look for characteristic values: 32 (LOGON_EXTRA_SIDS) or 544 (32+512 = EXTRA_SIDS + RESOURCE_GROUPS)
+	for i := 8; i < len(data)-4; i++ {
+		flags := binary.LittleEndian.Uint32(data[i:])
+		// Common UserFlags values
+		if flags == 32 || flags == 544 || flags == 0x20 || flags == 0x220 {
+			result.UserFlags = flags
+			break
+		}
+	}
+
 	// Search for user RID and primary group
 	// These are typically near each other in the structure
 	for i := 0; i < len(data)-8; i++ {
@@ -125,7 +147,16 @@ func DecodePAC(pacData []byte) (*DecodedPAC, error) {
 	// Find extra SIDs (full SIDs, not RIDs)
 	extraSIDs := findExtraSIDs(data)
 	for _, sid := range extraSIDs {
-		result.ExtraSIDs = append(result.ExtraSIDs, sid.String())
+		sidStr := sid.String()
+		result.ExtraSIDs = append(result.ExtraSIDs, sidStr)
+
+		// Check for S4U2Self indicators
+		if sidStr == "S-1-18-1" {
+			result.HasAuthAssertedIdentity = true // Normal AS-REQ
+		} else if sidStr == "S-1-18-2" {
+			result.HasServiceAssertedIdentity = true // S4U2Self!
+		}
+
 		// Check for builtin Administrators S-1-5-32-544
 		if sid.NumSubAuthorities == 2 && len(sid.SubAuthorities) >= 2 {
 			if sid.SubAuthorities[0] == 32 && sid.SubAuthorities[1] == 544 {
@@ -188,33 +219,49 @@ func findGroupRIDs(data []byte) []GroupMembership {
 func findExtraSIDs(data []byte) []*SID {
 	var sids []*SID
 
-	// Search for SID patterns that are NOT 4-subauthority domain SIDs
+	// Search for SID patterns
+	// - Authority 5 (NT Authority): S-1-5-x-x-x-x (most SIDs)
+	// - Authority 18 (Authentication Authority): S-1-18-1 and S-1-18-2
 	for i := 0; i < len(data)-16; i++ {
-		// Look for revision=1, numSubAuth=2-10, authority=5
-		if data[i] == 0x01 && data[i+1] >= 2 && data[i+1] <= 10 {
-			if data[i+2] == 0 && data[i+3] == 0 && data[i+4] == 0 && data[i+5] == 0 && data[i+6] == 0 && data[i+7] == 5 {
-				numSub := int(data[i+1])
-				sidLen := 8 + numSub*4
-				if i+sidLen <= len(data) {
-					// Skip domain SIDs (4 sub-authorities starting with 21)
-					sub0 := binary.LittleEndian.Uint32(data[i+8:])
-					if numSub == 4 && sub0 == 21 {
-						continue // Skip domain SID
-					}
+		// Look for revision=1, numSubAuth=1-10
+		if data[i] != 0x01 || data[i+1] < 1 || data[i+1] > 10 {
+			continue
+		}
 
-					sid := &SID{
-						Revision:          data[i],
-						NumSubAuthorities: data[i+1],
-					}
-					copy(sid.Authority[:], data[i+2:i+8])
-					sid.SubAuthorities = make([]uint32, numSub)
-					for j := 0; j < numSub; j++ {
-						sid.SubAuthorities[j] = binary.LittleEndian.Uint32(data[i+8+j*4:])
-					}
-					sids = append(sids, sid)
-				}
+		// Check for valid authority (5 or 18 in big-endian 6-byte format)
+		// Authority 5: 00 00 00 00 00 05
+		// Authority 18: 00 00 00 00 00 12
+		isAuth5 := data[i+2] == 0 && data[i+3] == 0 && data[i+4] == 0 && data[i+5] == 0 && data[i+6] == 0 && data[i+7] == 5
+		isAuth18 := data[i+2] == 0 && data[i+3] == 0 && data[i+4] == 0 && data[i+5] == 0 && data[i+6] == 0 && data[i+7] == 18
+
+		if !isAuth5 && !isAuth18 {
+			continue
+		}
+
+		numSub := int(data[i+1])
+		sidLen := 8 + numSub*4
+		if i+sidLen > len(data) {
+			continue
+		}
+
+		// For authority 5: skip domain SIDs (4 sub-authorities starting with 21)
+		if isAuth5 {
+			sub0 := binary.LittleEndian.Uint32(data[i+8:])
+			if numSub == 4 && sub0 == 21 {
+				continue // Skip domain SID
 			}
 		}
+
+		sid := &SID{
+			Revision:          data[i],
+			NumSubAuthorities: data[i+1],
+		}
+		copy(sid.Authority[:], data[i+2:i+8])
+		sid.SubAuthorities = make([]uint32, numSub)
+		for j := 0; j < numSub; j++ {
+			sid.SubAuthorities[j] = binary.LittleEndian.Uint32(data[i+8+j*4:])
+		}
+		sids = append(sids, sid)
 	}
 
 	// Deduplicate

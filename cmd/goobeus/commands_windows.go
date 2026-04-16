@@ -16,9 +16,18 @@ import (
 
 // cmdPTT handles pass-the-ticket on Windows.
 func cmdPTT(args []string) error {
-	ticketPath := flags.ticket
-	if len(args) > 0 {
-		ticketPath = args[0]
+	fs := flag.NewFlagSet("ptt", flag.ExitOnError)
+	var ticketPath string
+	fs.StringVar(&ticketPath, "t", "", "Path to ticket file (.kirbi)")
+	fs.StringVar(&ticketPath, "ticket", "", "Path to ticket file (.kirbi)")
+	fs.Parse(args)
+
+	// Also accept ticket from global flags or as positional argument
+	if ticketPath == "" {
+		ticketPath = flags.ticket
+	}
+	if ticketPath == "" && fs.NArg() > 0 {
+		ticketPath = fs.Arg(0)
 	}
 	if ticketPath == "" {
 		return fmt.Errorf("ticket required (-t or as argument)")
@@ -211,15 +220,17 @@ func formatDuration(d time.Duration) string {
 func cmdTGTDeleg(args []string) error {
 	// Parse flags
 	fs := flag.NewFlagSet("tgtdeleg", flag.ExitOnError)
-	var outfile string
+	var outfile, spn string
 	fs.StringVar(&outfile, "o", "", "Output file (.kirbi or .ccache)")
 	fs.StringVar(&outfile, "outfile", "", "Output file (.kirbi or .ccache)")
+	fs.StringVar(&spn, "spn", "", "Target SPN (e.g., cifs/dc.domain.com)")
+	fs.StringVar(&spn, "s", "", "Target SPN (e.g., cifs/dc.domain.com)")
 	fs.Parse(args)
 
 	// Create flags struct to match the display code expectations
 	flags := struct{ outfile string }{outfile: outfile}
 
-	result, err := windows.ExtractTGTDeleg()
+	result, err := windows.ExtractTGTDelegWithSPN(spn)
 	if err != nil {
 		return fmt.Errorf("tgtdeleg failed: %w", err)
 	}

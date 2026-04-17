@@ -181,7 +181,7 @@ func buildNativeASREQ(realm, username, password string) ([]byte, []byte, error) 
 	till := now.Add(24 * time.Hour)
 	nonce := rand.Uint32()
 
-	// KDC options: FORWARDABLE | RENEWABLE | PROXIABLE
+	// KDC options: FORWARDABLE | RENEWABLE | CANONICALIZE | RENEWABLE-OK
 	kdcOptions := []byte{0x40, 0x81, 0x00, 0x10} // 0x40810010
 
 	// Build name strings with GeneralString encoding

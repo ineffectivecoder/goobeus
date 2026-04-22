@@ -581,9 +581,10 @@ func buildPAForUser(targetUser, targetRealm string, sessionKey []byte, etype int
 	// 2. Name string values concatenated
 	// 3. User realm string
 	// 4. Auth-package string ("Kerberos")
-	// Use lowercase to match Impacket's working pcap capture
-	lowerUser := strings.ToLower(targetUser)
-	lowerRealm := strings.ToLower(targetRealm)
+	// Realm is uppercased to match what a real Windows client emits (AD realm
+	// names are stored uppercase). The wire encoding below MUST use the same
+	// bytes — the KDC verifies the HMAC over what it reads on the wire.
+	upperRealm := strings.ToUpper(targetRealm)
 
 	var checksumData []byte
 	nameType := make([]byte, 4)
@@ -592,8 +593,8 @@ func buildPAForUser(targetUser, targetRealm string, sessionKey []byte, etype int
 	nameType[2] = 0
 	nameType[3] = 0
 	checksumData = append(checksumData, nameType...)
-	checksumData = append(checksumData, []byte(lowerUser)...)
-	checksumData = append(checksumData, []byte(lowerRealm)...)
+	checksumData = append(checksumData, []byte(targetUser)...)
+	checksumData = append(checksumData, []byte(upperRealm)...)
 	checksumData = append(checksumData, []byte("Kerberos")...)
 
 	// Compute HMAC-MD5 checksum (always type -138 for PA-FOR-USER)
@@ -660,15 +661,14 @@ func buildPAForUser(targetUser, targetRealm string, sessionKey []byte, etype int
 	}
 
 	// [0] PrincipalName { [0] name-type INTEGER, [1] name-string SEQUENCE OF GeneralString }
-	// Use lowercase to match Impacket's working pcap
 	nameTypeBytes := wrapExplicit(0, buildInt(asn1krb5.NTPrincipal))
-	nameStringSeq := wrapSeq(buildGeneralString(lowerUser))
+	nameStringSeq := wrapSeq(buildGeneralString(targetUser))
 	nameStringBytes := wrapExplicit(1, nameStringSeq)
 	principalSeq := wrapSeq(append(nameTypeBytes, nameStringBytes...))
 	userName := wrapExplicit(0, principalSeq)
 
 	// [1] Realm (GeneralString)
-	userRealm := wrapExplicit(1, buildGeneralString(lowerRealm))
+	userRealm := wrapExplicit(1, buildGeneralString(upperRealm))
 
 	// [2] Checksum { [0] cksumtype INTEGER, [1] checksum OCTET STRING }
 	cksumTypeBytes := wrapExplicit(0, buildInt(cksumType))

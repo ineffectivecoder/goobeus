@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"encoding/asn1"
 	"fmt"
 	"math/rand"
 	"os"
@@ -89,6 +90,14 @@ type NativeASResult struct {
 	SessionKey  asn1krb5.EncryptionKey // Session key from enc-part
 	CRealm      string
 	CName       []string
+	// Lifetime fields from EncASRepPart — these reflect what the KDC actually
+	// granted under the domain's policy. Use them instead of hardcoding so a
+	// forged TGT inherits real domain-policy lifetimes.
+	Flags     asn1.BitString
+	AuthTime  time.Time
+	StartTime time.Time
+	EndTime   time.Time
+	RenewTill time.Time
 }
 
 // buildNativeASREQNoPreauth builds Phase 1 AS-REQ without preauth (like Impacket's first request).
@@ -519,6 +528,23 @@ func parseNativeASREP(data []byte, clientKey []byte) (*NativeASResult, error) {
 	fmt.Printf("[DEBUG] Session key: etype=%d, len=%d, first8=%x\n",
 		sessionKey.KeyType, len(sessionKey.KeyValue), sessionKey.KeyValue[:8])
 
+	// Parse the full EncASRepPart so we can capture the KDC-granted lifetimes
+	// (endtime, renew-till, flags). These reflect domain policy and let the
+	// caller forge tickets that match what real AS-REPs from this DC look like
+	// instead of using hardcoded +10h/+7d defaults.
+	var encPart asn1krb5.EncASRepPart
+	flags := asn1.BitString{}
+	var authTime, startTime, endTime, renewTill time.Time
+	if _, perr := asn1.UnmarshalWithParams(plaintext, &encPart, "application,tag:25"); perr == nil {
+		flags = encPart.Flags
+		authTime = encPart.AuthTime
+		startTime = encPart.StartTime
+		endTime = encPart.EndTime
+		renewTill = encPart.RenewTill
+	} else {
+		fmt.Printf("[DEBUG] EncASRepPart parse failed (lifetimes unavailable): %v\n", perr)
+	}
+
 	// Parse ticket - extract key fields needed for TGS-REQ
 	// The ticketBytes already contain the APPLICATION 1 wrapped ticket
 	realm, sname := extractTicketFields(ticketBytes)
@@ -534,6 +560,11 @@ func parseNativeASREP(data []byte, clientKey []byte) (*NativeASResult, error) {
 		Ticket:      ticket,
 		SessionKey:  sessionKey,
 		CRealm:      realm,
+		Flags:       flags,
+		AuthTime:    authTime,
+		StartTime:   startTime,
+		EndTime:     endTime,
+		RenewTill:   renewTill,
 	}, nil
 }
 

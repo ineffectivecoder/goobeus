@@ -352,17 +352,17 @@ func readCredential(r io.Reader, version uint16) (*CCacheCredential, error) {
 	}
 	c.Server = *server
 
-	// Read keyblock
+	// Read keyblock: v3 has a duplicate enctype field, v4 does not.
+	// Length is uint32 (uses put_len_bytes in MIT krb5 ccmarshal.c).
 	if err := binary.Read(r, binary.BigEndian, &c.Key.KeyType); err != nil {
 		return nil, err
 	}
-	if version == CCacheVersion4 {
+	if version == CCacheVersion3 {
 		if err := binary.Read(r, binary.BigEndian, &c.Key.EType); err != nil {
 			return nil, err
 		}
 	}
-	// Key length is uint16 in ccache format (unlike ticket which uses uint32)
-	var keyLen uint16
+	var keyLen uint32
 	if err := binary.Read(r, binary.BigEndian, &keyLen); err != nil {
 		return nil, err
 	}
@@ -448,15 +448,12 @@ func writeCredential(w io.Writer, c *CCacheCredential) error {
 		return err
 	}
 
-	// Write keyblock (v4 format)
+	// Write keyblock: v4 is keytype(u16) + keylen(u32) + key.
+	// The etype field only exists in v3; see MIT krb5 ccmarshal.c marshal_keyblock.
 	if err := binary.Write(w, binary.BigEndian, c.Key.KeyType); err != nil {
 		return err
 	}
-	if err := binary.Write(w, binary.BigEndian, c.Key.EType); err != nil {
-		return err
-	}
-	// Write key with uint16 length (MIT ccache format)
-	if err := binary.Write(w, binary.BigEndian, uint16(len(c.Key.Key))); err != nil {
+	if err := binary.Write(w, binary.BigEndian, uint32(len(c.Key.Key))); err != nil {
 		return err
 	}
 	if _, err := w.Write(c.Key.Key); err != nil {
@@ -632,6 +629,16 @@ func credentialToKirbi(cred *CCacheCredential) (*Kirbi, error) {
 	}, nil
 }
 
+// bitStringToU32 converts a ticket-flags BitString (MSB-first 4 bytes) to uint32.
+// Handles short or empty BitStrings by zero-extending.
+func bitStringToU32(b asn1.BitString) uint32 {
+	var v uint32
+	for i := 0; i < len(b.Bytes) && i < 4; i++ {
+		v |= uint32(b.Bytes[i]) << (24 - 8*i)
+	}
+	return v
+}
+
 // ccacheFlagsToASN1 converts ccache ticket flags to ASN.1 BitString.
 func ccacheFlagsToASN1(flags uint32) asn1.BitString {
 	return asn1.BitString{
@@ -691,7 +698,7 @@ func kirbiToCredential(kirbi *Kirbi, ticketIdx int) (*CCacheCredential, error) {
 		EndTime:     uint32(info.EndTime.Unix()),
 		RenewTill:   uint32(info.RenewTill.Unix()),
 		IsSKey:      0,
-		TicketFlags: 0x50e00000, // FORWARDABLE | RENEWABLE | INITIAL | PRE-AUTHENT
+		TicketFlags: bitStringToU32(info.Flags),
 		Ticket:      ticketBytes,
 	}
 

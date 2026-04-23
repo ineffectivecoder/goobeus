@@ -26,6 +26,12 @@ type DecodedPAC struct {
 	ResourceGroupIDs   []uint32
 	ResourceDomainSID  string
 
+	// PAC_ATTRIBUTES_INFO flags (MS-PAC 2.14)
+	//   0x1 = PAC_WAS_REQUESTED (normal AS-REQ with pA-PAC-REQUEST)
+	//   0x2 = PAC_WAS_GIVEN_IMPLICITLY (S4U2Self)
+	HasPACAttributes  bool
+	PACAttributeFlags uint32
+
 	// Well-known group analysis
 	IsDomainAdmin     bool
 	IsEnterpriseAdmin bool
@@ -163,6 +169,13 @@ func DecodePAC(pacData []byte) (*DecodedPAC, error) {
 				result.IsBuiltinAdmin = true
 			}
 		}
+	}
+
+	// Extract PAC_ATTRIBUTES_INFO flags (buffer type 17) if present.
+	// Layout: uint32 FlagsLength (bit count) + uint32 Flags
+	if attrBuf := pac.GetBuffer(AttributesType); attrBuf != nil && len(attrBuf.Data) >= 8 {
+		result.HasPACAttributes = true
+		result.PACAttributeFlags = binary.LittleEndian.Uint32(attrBuf.Data[4:8])
 	}
 
 	// Try to extract username from UPN_DNS_INFO if present
@@ -372,6 +385,54 @@ func (d *DecodedPAC) String() string {
 			}
 			sb.WriteString(fmt.Sprintf("    %s%s\n", s, label))
 		}
+	}
+
+	// UserFlags (KERB_VALIDATION_INFO.UserFlags)
+	sb.WriteString("\n")
+	sb.WriteString("  ───────────────────────────────────────────────────────────────────────────\n")
+	sb.WriteString(fmt.Sprintf("  USER FLAGS: 0x%X (%d)\n", d.UserFlags, d.UserFlags))
+	if d.UserFlags&0x20 != 0 {
+		sb.WriteString("    ✓ LOGON_EXTRA_SIDS (0x20) - ExtraSids array populated\n")
+	}
+	if d.UserFlags&0x200 != 0 {
+		sb.WriteString("    ⚠ LOGON_RESOURCE_GROUPS (0x200) - S4U2Self watermark!\n")
+	}
+	if d.UserFlags == 0 {
+		sb.WriteString("    (none set)\n")
+	}
+
+	// PAC_ATTRIBUTES_INFO
+	if d.HasPACAttributes {
+		sb.WriteString("\n")
+		sb.WriteString("  ───────────────────────────────────────────────────────────────────────────\n")
+		sb.WriteString(fmt.Sprintf("  PAC_ATTRIBUTES_INFO Flags: 0x%X\n", d.PACAttributeFlags))
+		if d.PACAttributeFlags&0x1 != 0 {
+			sb.WriteString("    ✓ PAC_WAS_REQUESTED (0x1) - client sent pA-PAC-REQUEST (AS-REQ)\n")
+		}
+		if d.PACAttributeFlags&0x2 != 0 {
+			sb.WriteString("    ⚠ PAC_WAS_GIVEN_IMPLICITLY (0x2) - S4U2Self watermark!\n")
+		}
+	}
+
+	// Sapphire / S4U2Self watermark verdict
+	sb.WriteString("\n")
+	sb.WriteString("  ───────────────────────────────────────────────────────────────────────────\n")
+	sb.WriteString("  S4U2Self WATERMARK STATUS:\n")
+	watermarks := 0
+	if d.HasServiceAssertedIdentity {
+		sb.WriteString("    ⚠ S-1-18-2 in ExtraSids (SERVICE_ASSERTED_IDENTITY)\n")
+		watermarks++
+	}
+	if d.UserFlags&0x200 != 0 {
+		sb.WriteString("    ⚠ LOGON_RESOURCE_GROUPS bit set in UserFlags\n")
+		watermarks++
+	}
+	if d.HasPACAttributes && d.PACAttributeFlags&0x2 != 0 {
+		sb.WriteString("    ⚠ PAC_WAS_GIVEN_IMPLICITLY in PAC_ATTRIBUTES_INFO\n")
+		watermarks++
+	}
+	if watermarks == 0 {
+		sb.WriteString("    ✓ Clean — no known S4U2Self watermarks present\n")
 	}
 
 	sb.WriteString("╚═══════════════════════════════════════════════════════════════════════════╝\n")

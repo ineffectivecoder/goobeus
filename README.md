@@ -117,7 +117,7 @@ goobeus -d corp.local -u lowpriv -p 'LowPrivPass!' sapphire \
 goobeus -d corp.local -u lowpriv -p 'LowPrivPass!' sapphire \
   --aeskey <krbtgt_aes256> --nthash <krbtgt_nthash> \
   --impersonate Administrator \
-  --strip-watermark --strip-logon-flags --strip-pac-attributes \
+  --strip-watermark --strip-logon-flags --strip-pac-attributes --strip-full-checksum \
   -o admin.ccache
 ```
 
@@ -133,15 +133,18 @@ goobeus -d corp.local -u lowpriv -p 'LowPrivPass!' sapphire \
 >
 > Both `--aeskey` (krbtgt AES256) and `--nthash` (krbtgt RC4) are accepted; provide both when available so PAC re-signing preserves whatever checksum types the original PAC used (avoids a "checksum type changed" detection).
 >
-> #### PAC watermark stripping (`--strip-watermark`, `--strip-logon-flags`, `--strip-pac-attributes`)
+> #### PAC watermark stripping (`--strip-watermark`, `--strip-logon-flags`, `--strip-pac-attributes`, `--strip-full-checksum`)
 >
-> When the KDC issues a service ticket via S4U2Self, it stamps **three** watermarks into the PAC that together identify it as an impersonation artifact. A sapphire-forged TGT inherits all of them because it reuses the victim's real PAC. All three are structurally impossible for a legitimate AS-REQ-issued TGT, so any detection with access to the `krbtgt` key can decrypt the ticket and flag them — regardless of how clean the wire-level Kerberos fields look.
+> When the KDC issues a service ticket via S4U2Self, it stamps **four** independent watermarks into the PAC that identify it as an impersonation artifact. A sapphire-forged TGT inherits all of them because it reuses the victim's real PAC. Each is structurally impossible for a legitimate AS-REQ-issued TGT, so any detection with access to the `krbtgt` key can decrypt the ticket and flag them — regardless of how clean the wire-level Kerberos fields look.
+>
+> Empirical testing against CrowdStrike Falcon Identity Protection shows the detection is **OR-logic across all four**: any single watermark present triggers the alert. **All four must be neutralized for a full bypass.** See [docs/FIP_TESTING.md](docs/FIP_TESTING.md) for the full test matrix.
 >
 > - `--strip-watermark` — rewrites `S-1-18-2` (`SERVICE_ASSERTED_IDENTITY`) in `ExtraSids` to `S-1-18-1` (`AUTHENTICATION_AUTHORITY_ASSERTED_IDENTITY`). Single-byte flip, no NDR re-alignment needed; signatures are recomputed by the downstream re-sign step.
 > - `--strip-logon-flags` — clears the `LOGON_RESOURCE_GROUPS (0x200)` bit from `KERB_VALIDATION_INFO.UserFlags`. This bit is set by the KDC on S4U2Self responses and never appears on normal AS-REQ TGTs. Scoped to the `LOGON_INFO` buffer only to avoid false-positive matches elsewhere in the PAC.
 > - `--strip-pac-attributes` — rewrites `PAC_ATTRIBUTES_INFO.Flags` from `0x2` (`PAC_WAS_GIVEN_IMPLICITLY`, the KDC's signal that it issued the PAC for S4U2Self without a client request) to `0x1` (`PAC_WAS_REQUESTED`, matching what a Windows client gets when it sends `pA-PAC-REQUEST` on a normal AS-REQ).
+> - `--strip-full-checksum` — removes the `PAC_FULL_CHECKSUM` buffer (type 19). This buffer was added in KB5020805 (November 2022) as an explicit anti-sapphire measure: an extended KDC-keyed HMAC over the entire PAC, designed to fail validation after PAC transplantation. On patched DCs the buffer is present and carries a checksum valid only for the original S4U2Self ticket; removing it entirely bypasses validation since the rule fails open on absence.
 >
-> Use all three flags together for the cleanest output. The resulting PAC content is indistinguishable from a legitimate AS-REQ TGT for the impersonated user. Verify with `goobeus describe -t <ticket> -k <krbtgt_aes256>` — under `PAC AUTHORIZATION DATA` you should see `S-1-18-1` in `EXTRA SIDS`, `USER FLAGS: 0x20`, `PAC_ATTRIBUTES_INFO Flags: 0x1`, and a final `S4U2Self WATERMARK STATUS: ✓ Clean` verdict.
+> **Use all four flags together.** Skipping any one leaves the corresponding watermark active and triggers detection. Verify with `goobeus describe -t <ticket> -k <krbtgt_aes256>` — under `PAC AUTHORIZATION DATA` you should see `S-1-18-1` in `EXTRA SIDS`, `USER FLAGS: 0x20`, `PAC_ATTRIBUTES_INFO Flags: 0x1`, `PAC BUFFER INVENTORY (8 buffers)` (no type-19), and a final `S4U2Self WATERMARK STATUS: ✓ Clean` verdict.
 
 ### Roasting Attacks
 

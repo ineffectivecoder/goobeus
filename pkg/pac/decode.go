@@ -6,6 +6,14 @@ import (
 	"strings"
 )
 
+// BufferSummary describes a single PAC buffer for inventory display.
+type BufferSummary struct {
+	Type   uint32
+	Size   uint32
+	Offset uint64
+	Name   string
+}
+
 // DecodedPAC contains human-readable PAC information.
 type DecodedPAC struct {
 	// User info
@@ -32,6 +40,9 @@ type DecodedPAC struct {
 	HasPACAttributes  bool
 	PACAttributeFlags uint32
 
+	// Raw buffer inventory (type, size, offset) in PAC-header order.
+	BufferInventory []BufferSummary
+
 	// Well-known group analysis
 	IsDomainAdmin     bool
 	IsEnterpriseAdmin bool
@@ -55,6 +66,17 @@ func DecodePAC(pacData []byte) (*DecodedPAC, error) {
 	}
 
 	result := &DecodedPAC{}
+
+	// Populate buffer inventory (in PAC-header order) for display
+	for i := range pac.Buffers {
+		b := &pac.Buffers[i]
+		result.BufferInventory = append(result.BufferInventory, BufferSummary{
+			Type:   b.Type,
+			Size:   b.Size,
+			Offset: b.Offset,
+			Name:   GetBufferTypeName(b.Type),
+		})
+	}
 
 	// Find LOGON_INFO buffer
 	logonBuf := pac.GetBuffer(LogonInfoType)
@@ -411,6 +433,20 @@ func (d *DecodedPAC) String() string {
 		}
 		if d.PACAttributeFlags&0x2 != 0 {
 			sb.WriteString("    ⚠ PAC_WAS_GIVEN_IMPLICITLY (0x2) - S4U2Self watermark!\n")
+		}
+	}
+
+	// Buffer inventory (shows buffer count + types + sizes + offsets).
+	// Useful for comparing against KDC-native PAC layouts (e.g. detecting
+	// presence/absence of PAC_FULL_CHECKSUM across DC patch levels).
+	if len(d.BufferInventory) > 0 {
+		sb.WriteString("\n")
+		sb.WriteString("  ───────────────────────────────────────────────────────────────────────────\n")
+		sb.WriteString(fmt.Sprintf("  PAC BUFFER INVENTORY (%d buffers):\n", len(d.BufferInventory)))
+		sb.WriteString("    Idx  Type  Name              Size  Offset\n")
+		for i, b := range d.BufferInventory {
+			sb.WriteString(fmt.Sprintf("    [%d]  %3d   %-17s %4d  %d\n",
+				i, b.Type, b.Name, b.Size, b.Offset))
 		}
 	}
 

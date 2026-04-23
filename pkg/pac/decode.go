@@ -424,15 +424,27 @@ func (d *DecodedPAC) String() string {
 	}
 
 	// PAC_ATTRIBUTES_INFO
+	//
+	// Flags interpretation is AMBIGUOUS:
+	//   0x1 (PAC_WAS_REQUESTED): client sent pA-PAC-REQUEST on AS-REQ. Normal
+	//       for Windows domain-joined clients on fresh logon.
+	//   0x2 (PAC_WAS_GIVEN_IMPLICITLY): KDC emitted the PAC without an explicit
+	//       client request. Normal for:
+	//         - MIT kinit / non-Windows clients (they don't send pA-PAC-REQUEST)
+	//         - S4U2Self service tickets (issued on behalf of impersonator)
+	//   So 0x2 alone does NOT definitively indicate S4U2Self — it's a signal
+	//   that must be interpreted in context. Empirically confirmed that MIT
+	//   kinit AS-REQ TGTs on a patched Windows Server KDC carry Flags=0x2.
 	if d.HasPACAttributes {
 		sb.WriteString("\n")
 		sb.WriteString("  ───────────────────────────────────────────────────────────────────────────\n")
 		sb.WriteString(fmt.Sprintf("  PAC_ATTRIBUTES_INFO Flags: 0x%X\n", d.PACAttributeFlags))
 		if d.PACAttributeFlags&0x1 != 0 {
-			sb.WriteString("    ✓ PAC_WAS_REQUESTED (0x1) - client sent pA-PAC-REQUEST (AS-REQ)\n")
+			sb.WriteString("    ✓ PAC_WAS_REQUESTED (0x1) - client sent pA-PAC-REQUEST (Windows-style AS-REQ)\n")
 		}
 		if d.PACAttributeFlags&0x2 != 0 {
-			sb.WriteString("    ⚠ PAC_WAS_GIVEN_IMPLICITLY (0x2) - S4U2Self watermark!\n")
+			sb.WriteString("    • PAC_WAS_GIVEN_IMPLICITLY (0x2) - KDC issued PAC without explicit request\n")
+			sb.WriteString("      Ambiguous: normal for MIT kinit AND for S4U2Self service tickets\n")
 		}
 	}
 
@@ -450,25 +462,30 @@ func (d *DecodedPAC) String() string {
 		}
 	}
 
-	// Sapphire / S4U2Self watermark verdict
+	// Sapphire / S4U2Self watermark verdict.
+	//
+	// Only indicators that are *unambiguous* markers of S4U2Self origin are
+	// treated as watermarks here. PAC_ATTRIBUTES_INFO Flags=0x2 is NOT one of
+	// them: it's also the normal value for MIT kinit AS-REQ TGTs, so flagging
+	// it as an S4U2Self watermark produces false positives against legit
+	// non-Windows clients.
 	sb.WriteString("\n")
 	sb.WriteString("  ───────────────────────────────────────────────────────────────────────────\n")
 	sb.WriteString("  S4U2Self WATERMARK STATUS:\n")
 	watermarks := 0
 	if d.HasServiceAssertedIdentity {
-		sb.WriteString("    ⚠ S-1-18-2 in ExtraSids (SERVICE_ASSERTED_IDENTITY)\n")
+		sb.WriteString("    ⚠ S-1-18-2 in ExtraSids (SERVICE_ASSERTED_IDENTITY) — only appears in S4U2Self tickets\n")
 		watermarks++
 	}
 	if d.UserFlags&0x200 != 0 {
-		sb.WriteString("    ⚠ LOGON_RESOURCE_GROUPS bit set in UserFlags\n")
-		watermarks++
-	}
-	if d.HasPACAttributes && d.PACAttributeFlags&0x2 != 0 {
-		sb.WriteString("    ⚠ PAC_WAS_GIVEN_IMPLICITLY in PAC_ATTRIBUTES_INFO\n")
+		sb.WriteString("    ⚠ LOGON_RESOURCE_GROUPS bit set in UserFlags — only set by KDC on S4U2Self responses\n")
 		watermarks++
 	}
 	if watermarks == 0 {
-		sb.WriteString("    ✓ Clean — no known S4U2Self watermarks present\n")
+		sb.WriteString("    ✓ Clean — no unambiguous S4U2Self watermarks present\n")
+		if d.HasPACAttributes && d.PACAttributeFlags&0x2 != 0 {
+			sb.WriteString("    (note: PAC_ATTRIBUTES_INFO Flags=0x2 present but ambiguous — also normal for kinit-issued AS-REQ TGTs)\n")
+		}
 	}
 
 	sb.WriteString("╚═══════════════════════════════════════════════════════════════════════════╝\n")

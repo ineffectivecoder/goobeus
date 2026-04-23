@@ -117,7 +117,9 @@ goobeus -d corp.local -u lowpriv -p 'LowPrivPass!' sapphire \
 goobeus -d corp.local -u lowpriv -p 'LowPrivPass!' sapphire \
   --aeskey <krbtgt_aes256> --nthash <krbtgt_nthash> \
   --impersonate Administrator \
-  --strip-watermark --strip-logon-flags --strip-pac-attributes --strip-full-checksum \
+  --strip-watermark --strip-logon-flags --strip-pac-attributes \
+  --strip-full-checksum --strip-ticket-checksum \
+  --normalize-buffer-order --sync-client-info-time \
   -o admin.ccache
 ```
 
@@ -133,18 +135,33 @@ goobeus -d corp.local -u lowpriv -p 'LowPrivPass!' sapphire \
 >
 > Both `--aeskey` (krbtgt AES256) and `--nthash` (krbtgt RC4) are accepted; provide both when available so PAC re-signing preserves whatever checksum types the original PAC used (avoids a "checksum type changed" detection).
 >
-> #### PAC watermark stripping (`--strip-watermark`, `--strip-logon-flags`, `--strip-pac-attributes`, `--strip-full-checksum`)
+> #### PAC watermark stripping, structural normalization, and consistency sync
 >
-> When the KDC issues a service ticket via S4U2Self, it stamps **four** independent watermarks into the PAC that identify it as an impersonation artifact. A sapphire-forged TGT inherits all of them because it reuses the victim's real PAC. Each is structurally impossible for a legitimate AS-REQ-issued TGT, so any detection with access to the `krbtgt` key can decrypt the ticket and flag them — regardless of how clean the wire-level Kerberos fields look.
+> When the KDC issues a service ticket via S4U2Self, it stamps several independent watermarks and stale-after-transplant checksums into the PAC that identify it as an impersonation artifact. A sapphire-forged TGT inherits all of them because it reuses the victim's real PAC. Each is structurally impossible for a legitimate AS-REQ-issued TGT, so any detection with access to the `krbtgt` key can decrypt the ticket and flag them — regardless of how clean the wire-level Kerberos fields look.
 >
-> Empirical testing against CrowdStrike Falcon Identity Protection shows the detection is **OR-logic across all four**: any single watermark present triggers the alert. **All four must be neutralized for a full bypass.** See [docs/FIP_TESTING.md](docs/FIP_TESTING.md) for the full test matrix.
+> Empirical testing against CrowdStrike Falcon Identity Protection has confirmed OR-logic detection across multiple PAC-content indicators: any single indicator present triggers the alert. See [docs/FIP_TESTING.md](docs/FIP_TESTING.md) for the full test matrix, latency analysis, and account-level behavioral escalation findings.
+>
+> **PAC-content watermark strips (empirically confirmed as independent triggers in FIP):**
 >
 > - `--strip-watermark` — rewrites `S-1-18-2` (`SERVICE_ASSERTED_IDENTITY`) in `ExtraSids` to `S-1-18-1` (`AUTHENTICATION_AUTHORITY_ASSERTED_IDENTITY`). Single-byte flip, no NDR re-alignment needed; signatures are recomputed by the downstream re-sign step.
 > - `--strip-logon-flags` — clears the `LOGON_RESOURCE_GROUPS (0x200)` bit from `KERB_VALIDATION_INFO.UserFlags`. This bit is set by the KDC on S4U2Self responses and never appears on normal AS-REQ TGTs. Scoped to the `LOGON_INFO` buffer only to avoid false-positive matches elsewhere in the PAC.
 > - `--strip-pac-attributes` — rewrites `PAC_ATTRIBUTES_INFO.Flags` from `0x2` (`PAC_WAS_GIVEN_IMPLICITLY`, the KDC's signal that it issued the PAC for S4U2Self without a client request) to `0x1` (`PAC_WAS_REQUESTED`, matching what a Windows client gets when it sends `pA-PAC-REQUEST` on a normal AS-REQ).
-> - `--strip-full-checksum` — removes the `PAC_FULL_CHECKSUM` buffer (type 19). This buffer was added in KB5020805 (November 2022) as an explicit anti-sapphire measure: an extended KDC-keyed HMAC over the entire PAC, designed to fail validation after PAC transplantation. On patched DCs the buffer is present and carries a checksum valid only for the original S4U2Self ticket; removing it entirely bypasses validation since the rule fails open on absence.
+> - `--strip-full-checksum` — removes the `PAC_FULL_CHECKSUM` buffer (type 19). Added in KB5020805 (November 2022) as an explicit anti-sapphire measure: an extended KDC-keyed HMAC over the entire PAC, designed to fail validation after PAC transplantation. On patched DCs the buffer is present and carries a checksum valid only for the original S4U2Self ticket; removing it entirely bypasses validation since the rule fails open on absence.
 >
-> **Use all four flags together.** Skipping any one leaves the corresponding watermark active and triggers detection. Verify with `goobeus describe -t <ticket> -k <krbtgt_aes256>` — under `PAC AUTHORIZATION DATA` you should see `S-1-18-1` in `EXTRA SIDS`, `USER FLAGS: 0x20`, `PAC_ATTRIBUTES_INFO Flags: 0x1`, `PAC BUFFER INVENTORY (8 buffers)` (no type-19), and a final `S4U2Self WATERMARK STATUS: ✓ Clean` verdict.
+> **Stale-checksum strip (functionally tested; likely load-bearing, verification pending):**
+>
+> - `--strip-ticket-checksum` — removes the `PAC_TICKET_CHECKSUM` buffer (type 16). Added in KB5008380 (July 2021) as a keyed HMAC over the entire `EncTicketPart` encoding, designed to prevent PAC transplantation between tickets (exactly what sapphire does). Inherited stale from the S4U2Self ticket; invalid in the forged TGT. **WARNING**: DCs in strict KB5008380 enforcement mode may reject tickets lacking this buffer. Functionally tested safe on DCs that accept legacy clients; failure mode is auth error at ticket use, not at forge.
+>
+> **Structural normalization and consistency (defensive; reduces secondary-IOC surface):**
+>
+> - `--normalize-buffer-order` — reorders PAC buffers to match the canonical KDC-native layout: `LOGON_INFO → CLIENT_INFO → UPN_DNS_INFO → SERVER_CHECKSUM → KDC_CHECKSUM → TICKET_CHECKSUM → FULL_CHECKSUM → ATTRIBUTES_INFO → REQUESTOR_SID`. Goobeus's `AddKB5008380Buffers` appends new buffers in a non-canonical order; detections that check layout ordering as a secondary IOC would flag the difference. Recompute of offsets preserves all buffer contents byte-for-byte.
+> - `--sync-client-info-time` — rewrites `CLIENT_INFO.ClientId` (a FILETIME at the start of the CLIENT_INFO buffer per MS-PAC 2.7) to match the forged TGT's `AuthTime`. Legitimate TGTs have these equal; sapphire inherits the S4U2Self issuance time which is seconds off from the attacker's AS-REP AuthTime. A consistency-check detection comparing these values would flag the mismatch.
+>
+> **Use all flags together.** Skipping any of the content strips leaves that indicator active and triggers detection. The structural normalization and consistency sync flags are defensive — removing secondary IOCs that FIP may not currently check but which make the ticket indistinguishable from a legitimate KDC-issued TGT at the PAC level.
+>
+> Verify with `goobeus describe -t <ticket> -k <krbtgt_aes256>` — under `PAC AUTHORIZATION DATA` you should see `S-1-18-1` in `EXTRA SIDS`, `USER FLAGS: 0x20`, `PAC_ATTRIBUTES_INFO Flags: 0x1`, `PAC BUFFER INVENTORY (7 buffers)` in canonical order (LOGON_INFO, CLIENT_INFO, UPN_DNS_INFO, SERVER_CHECKSUM, KDC_CHECKSUM, ATTRIBUTES_INFO, REQUESTOR_SID — no type-16 or type-19), and a final `S4U2Self WATERMARK STATUS: ✓ Clean` verdict.
+>
+> **Caveat — account-level behavioral escalation:** in testing, FIP exhibited a *per-account* escalation where a target account with accumulated risk score applies supplementary detection rules to subsequent Kerberos activity. A clean bypass validated against a cold account may still trip on the same account after prolonged abuse. For operational use, minimize repeated ticket forgery/use against the same target principal. See [docs/FIP_TESTING.md](docs/FIP_TESTING.md) for details.
 
 ### Roasting Attacks
 

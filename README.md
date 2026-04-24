@@ -162,7 +162,6 @@ goobeus -d corp.local -u lowpriv -p 'LowPrivPass!' sapphire \
 >
 > Verify with `goobeus describe -t <ticket> -k <krbtgt_aes256>` — under `PAC AUTHORIZATION DATA` you should see `S-1-18-1` in `EXTRA SIDS`, `USER FLAGS: 0x20`, `PAC_ATTRIBUTES_INFO Flags: 0x1`, `PAC BUFFER INVENTORY (7 buffers)` in canonical order (LOGON_INFO, CLIENT_INFO, UPN_DNS_INFO, SERVER_CHECKSUM, KDC_CHECKSUM, ATTRIBUTES_INFO, REQUESTOR_SID — no type-16 or type-19), and a final `S4U2Self WATERMARK STATUS: ✓ Clean` verdict.
 >
-> **Caveat — account-level behavioral escalation:** in testing, FIP exhibited a *per-account* escalation where a target account with accumulated risk score applies supplementary detection rules to subsequent Kerberos activity. A clean bypass validated against a cold account may still trip on the same account after prolonged abuse. For operational use, minimize repeated ticket forgery/use against the same target principal. See [docs/FIP_TESTING.md](docs/FIP_TESTING.md) for details.
 
 ### Roasting Attacks
 

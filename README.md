@@ -113,14 +113,16 @@ goobeus -d corp.local -u lowpriv -p 'LowPrivPass!' sapphire \
   --aeskey <krbtgt_aes256> --nthash <krbtgt_nthash> \
   --impersonate Administrator -o admin.ccache
 
-# Forge Sapphire Ticket with PAC watermarks stripped (stealthier)
+# Forge Sapphire Ticket with PAC byte-for-byte matching an MIT kinit AS-REQ TGT
+#   (every PAC buffer size and offset identical to a legit kinit-issued TGT;
+#    see docs/FIP_TESTING.md for the head-to-head diff)
 goobeus -d corp.local -u lowpriv -p 'LowPrivPass!' sapphire \
   --aeskey <krbtgt_aes256> --nthash <krbtgt_nthash> \
   --impersonate Administrator \
-  --strip-logon-flags --strip-pac-attributes \
-  --clear-extra-sids \
+  --strip-logon-flags \
+  --strip-extra-groups --clear-extra-sids \
   --strip-full-checksum --strip-ticket-checksum \
-  --sync-client-info-time \
+  --sync-client-info-time --strip-proxiable --kinit-renew-till \
   -o admin.ccache
 ```
 
@@ -144,9 +146,9 @@ goobeus -d corp.local -u lowpriv -p 'LowPrivPass!' sapphire \
 >
 > **PAC-content watermark strips (empirically confirmed as independent triggers in FIP):**
 >
-> - `--clear-extra-sids` — proper NDR-level removal of the ExtraSids array (SidCount=0, pointer=NULL, deferred bytes stripped, LOGON_INFO shrunk, subsequent PAC offsets rewritten). Matches legit MIT kinit AS-REQ TGT baseline exactly (empty ExtraSids).
+> - `--clear-extra-sids` — proper NDR-level removal of the `ExtraSids` array (`SidCount=0`, pointer=NULL, deferred bytes stripped, LOGON_INFO shrunk, subsequent PAC offsets rewritten). Matches legit MIT kinit AS-REQ TGT baseline exactly (empty ExtraSids). Without this the PAC carries `S-1-18-2` (`SERVICE_ASSERTED_IDENTITY`), the KDC's explicit S4U2Self marker.
 > - `--strip-logon-flags` — clears the `LOGON_RESOURCE_GROUPS (0x200)` bit from `KERB_VALIDATION_INFO.UserFlags`. This bit is set by the KDC on S4U2Self responses and never appears on normal AS-REQ TGTs. Scoped to the `LOGON_INFO` buffer only to avoid false-positive matches elsewhere in the PAC.
-> - `--strip-pac-attributes` — rewrites `PAC_ATTRIBUTES_INFO.Flags` from `0x2` (`PAC_WAS_GIVEN_IMPLICITLY`, the KDC's signal that it issued the PAC for S4U2Self without a client request) to `0x1` (`PAC_WAS_REQUESTED`, matching what a Windows client gets when it sends `pA-PAC-REQUEST` on a normal AS-REQ).
+> - `--strip-extra-groups` — NDR-level removal of the `RID 572` (Denied RODC Password Replication Group) entry from LOGON_INFO. On S4U2Self this entry is stamped into `ResourceGroupIds` with `attrs=0x20000007` (`SE_GROUP_RESOURCE` bit set) — a marker never present on an AS-REQ TGT where `ResourceGroupIds` is empty. The remover handles both `GroupIds` (attrs=0x7) and `ResourceGroupIds` (attrs=0x20000007) placements, shrinks LOGON_INFO by 12 bytes when the array becomes empty (MaxCount+entry), and rewrites all subsequent PAC buffer offsets.
 > - `--strip-full-checksum` — removes the `PAC_FULL_CHECKSUM` buffer (type 19). Added in KB5020805 (November 2022) as an explicit anti-sapphire measure: an extended KDC-keyed HMAC over the entire PAC, designed to fail validation after PAC transplantation. On patched DCs the buffer is present and carries a checksum valid only for the original S4U2Self ticket; removing it entirely bypasses validation since the rule fails open on absence.
 >
 > **Stale-checksum strip (functionally tested; likely load-bearing, verification pending):**
@@ -156,12 +158,18 @@ goobeus -d corp.local -u lowpriv -p 'LowPrivPass!' sapphire \
 > **Structural consistency (defensive; reduces secondary-IOC surface):**
 >
 > - `--sync-client-info-time` — rewrites `CLIENT_INFO.ClientId` (a FILETIME at the start of the CLIENT_INFO buffer per MS-PAC 2.7) to match the forged TGT's `AuthTime`. Legitimate TGTs have these equal; sapphire inherits the S4U2Self issuance time which is seconds off from the attacker's AS-REP AuthTime. A consistency-check detection comparing these values would flag the mismatch.
+> - `--strip-proxiable` — clears the `PROXIABLE` bit in `EncTicketPart.Flags`. Real Windows KDCs do not set this bit on AS-REP TGTs for protected / privileged accounts (Domain Admins, Protected Users). Leaving it set when forging a ticket for an admin user is a one-bit divergence from any legit TGT for that principal.
+> - `--kinit-renew-till` — forces `RenewTill = AuthTime + 7 days` on the forged TGT. Matches MIT `kinit`'s default renew window. Without this flag the forged TGT inherits the attacker's AS-REP renew-till (typically `+24h`), producing a shorter-than-policy window that is itself anomalous for a domain-admin TGT.
+>
+> **Not for kinit parity:**
+>
+> - `--strip-pac-attributes` — rewrites `PAC_ATTRIBUTES_INFO.Flags` from `0x2` (`PAC_WAS_GIVEN_IMPLICITLY`, the KDC's signal that it issued the PAC without an explicit client request) to `0x1` (`PAC_WAS_REQUESTED`, matching what a Windows client gets when it sends `pA-PAC-REQUEST` on a normal AS-REQ). **However**, empirical comparison with a real MIT kinit AS-REQ TGT shows kinit PACs carry `Flags=0x2`, not `0x1` — kinit does not send `pA-PAC-REQUEST`, so the KDC emits it implicitly. Applying this flag therefore matches *Windows-client* AS-REQ parity and actively diverges from *MIT kinit* AS-REQ parity. Pick one target — don't apply this flag when modeling a Linux/MIT environment.
 >
 > *(A previous `--normalize-buffer-order` flag was removed — empirical testing against a real MIT kinit AS-REQ TGT showed that goobeus's default buffer order already matches the KDC-native AS-REQ TGT layout. The "canonical" order the flag produced was derived from an S4U2Self service ticket and did not match any observed legitimate TGT.)*
 >
-> **Use all flags together.** Skipping any of the content strips leaves that indicator active and triggers detection. The structural normalization and consistency sync flags are defensive — removing secondary IOCs that FIP may not currently check but which make the ticket indistinguishable from a legitimate KDC-issued TGT at the PAC level.
+> **Use the full recipe.** Skipping any of the content strips leaves that indicator active. The consistency-sync flags are defensive — removing secondary IOCs that FIP may not currently check but which make the ticket indistinguishable from a legitimate KDC-issued TGT at the PAC level.
 >
-> Verify with `goobeus describe -t <ticket> -k <krbtgt_aes256>` — under `PAC AUTHORIZATION DATA` you should see `S-1-18-1` in `EXTRA SIDS`, `USER FLAGS: 0x20`, `PAC_ATTRIBUTES_INFO Flags: 0x1`, `PAC BUFFER INVENTORY (7 buffers)` in canonical order (LOGON_INFO, CLIENT_INFO, UPN_DNS_INFO, SERVER_CHECKSUM, KDC_CHECKSUM, ATTRIBUTES_INFO, REQUESTOR_SID — no type-16 or type-19), and a final `S4U2Self WATERMARK STATUS: ✓ Clean` verdict.
+> Verify with `goobeus describe -t <ticket> -k <krbtgt_aes256>`. Against a real MIT kinit TGT for the same principal you should see **every** PAC buffer size and offset match byte-for-byte: `LOGON_INFO` size 472, `SERVER_CHECKSUM` at 592, `KDC_CHECKSUM` at 608, `CLIENT_INFO` at 624, `UPN_DNS_INFO` at 648, `ATTRIBUTES_INFO` at 816, `REQUESTOR_SID` at 824 (the exact numbers vary with the domain/user length, but the layout is identical between forged and legit). Buffer types `16` (`PAC_TICKET_CHECKSUM`) and `19` (`PAC_FULL_CHECKSUM`) must be absent; `USER FLAGS` must be `0x20`; `PAC_ATTRIBUTES_INFO Flags` must be `0x2` (kinit parity) or `0x1` (Windows parity — pick one); `EXTRA SIDS` must be empty; `GROUP SIDS` must not contain `RID 572`; and the final line must read `S4U2Self WATERMARK STATUS: ✓ Clean`.
 >
 
 ### Roasting Attacks

@@ -144,7 +144,7 @@ goobeus -d corp.local -u lowpriv -p 'LowPrivPass!' sapphire \
 >
 > Empirical testing against CrowdStrike Falcon Identity Protection has confirmed OR-logic detection across multiple PAC-content indicators: any single indicator present triggers the alert. See [docs/FIP_TESTING.md](docs/FIP_TESTING.md) for the full test matrix, latency analysis, and account-level behavioral escalation findings.
 >
-> **PAC-content watermark strips (empirically confirmed as independent triggers in FIP):**
+> **PAC-content watermark strips :**
 >
 > - `--clear-extra-sids` — proper NDR-level removal of the `ExtraSids` array (`SidCount=0`, pointer=NULL, deferred bytes stripped, LOGON_INFO shrunk, subsequent PAC offsets rewritten). Matches legit MIT kinit AS-REQ TGT baseline exactly (empty ExtraSids). Without this the PAC carries `S-1-18-2` (`SERVICE_ASSERTED_IDENTITY`), the KDC's explicit S4U2Self marker.
 > - `--strip-logon-flags` — clears the `LOGON_RESOURCE_GROUPS (0x200)` bit from `KERB_VALIDATION_INFO.UserFlags`. This bit is set by the KDC on S4U2Self responses and never appears on normal AS-REQ TGTs. Scoped to the `LOGON_INFO` buffer only to avoid false-positive matches elsewhere in the PAC.

@@ -479,7 +479,7 @@ func cmdSapphire(args []string) error {
 	fs.BoolVar(&syncClientInfoTime, "sync-client-info-time", false, "Rewrite CLIENT_INFO.ClientId FILETIME to match forged TGT AuthTime (matches legit TGT invariant)")
 	fs.BoolVar(&stripProxiable, "strip-proxiable", false, "Clear PROXIABLE bit in EncTicketPart.Flags (matches KDC behavior for protected/privileged accounts)")
 	fs.BoolVar(&stripExtraGroups, "strip-extra-groups", false, "Substitute RID 572 (Denied RODC Password Replication Group) → RID 513 (Domain Users) in LOGON_INFO — removes S4U2Self-transitive group IOC while preserving PAC validity")
-	fs.BoolVar(&clearExtraSids, "clear-extra-sids", false, "Set SidCount=0 and ExtraSids=NULL in LOGON_INFO (proper NDR-level removal — matches legit kinit baseline of empty ExtraSids)")
+	fs.BoolVar(&clearExtraSids, "clear-extra-sids", false, "Set SidCount=0 and ExtraSids=NULL in LOGON_INFO (proper NDR-level removal — removes S-1-18-2 SERVICE_ASSERTED_IDENTITY watermark)")
 	fs.BoolVar(&kinitRenewTill, "kinit-renew-till", false, "Force RenewTill = AuthTime + 7 days (matches MIT kinit default; otherwise inherits attacker's +24h from AS-REP)")
 	fs.Parse(args)
 

